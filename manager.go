@@ -18,10 +18,14 @@ type Manager struct {
 	store       *Store
 	registry    Registry
 	workerCount int
+	slots       int
+	queueSize   int
 	jobs        chan string
 
 	mu       sync.Mutex
 	cancels  map[string]context.CancelFunc
+	running  int
+	queue    []string
 	stopping bool
 	stop     chan struct{}
 	wg       sync.WaitGroup
@@ -41,7 +45,9 @@ func NewManager(store *Store, registry Registry, slots, queueSize int) (*Manager
 		store:       store,
 		registry:    registry,
 		workerCount: slots,
-		jobs:        make(chan string, queueSize),
+		slots:       slots,
+		queueSize:   queueSize,
+		jobs:        make(chan string, slots),
 		cancels:     make(map[string]context.CancelFunc),
 		stop:        make(chan struct{}),
 	}
@@ -120,6 +126,11 @@ func (m *Manager) Cancel(id string) (Invocation, bool, error) {
 			next.FinishedAt = nowRFC3339()
 			next.UpdatedAt = next.FinishedAt
 		})
+		if transitioned {
+			m.mu.Lock()
+			m.removeQueuedLocked(id)
+			m.mu.Unlock()
+		}
 		return updated, transitioned, err
 	case StatusRunning:
 		m.mu.Lock()
@@ -137,19 +148,21 @@ func (m *Manager) Cancel(id string) (Invocation, bool, error) {
 
 func (m *Manager) dispatch(id string) bool {
 	m.mu.Lock()
-	if m.stopping {
-		m.mu.Unlock()
+	defer m.mu.Unlock()
+	if m.stopping || m.running+len(m.queue) >= m.slots+m.queueSize {
 		return false
 	}
-	m.mu.Unlock()
-	select {
-	case m.jobs <- id:
-		return true
-	case <-m.stop:
-		return false
-	default:
-		return false
+	if m.running < m.slots {
+		select {
+		case m.jobs <- id:
+			m.running++
+			return true
+		case <-m.stop:
+			return false
+		}
 	}
+	m.queue = append(m.queue, id)
+	return true
 }
 
 func (m *Manager) worker() {
@@ -160,8 +173,49 @@ func (m *Manager) worker() {
 			return
 		case id := <-m.jobs:
 			m.execute(id)
+			m.pullNext()
 		}
 	}
+}
+
+func (m *Manager) pullNext() {
+	m.mu.Lock()
+	if len(m.queue) == 0 {
+		m.running--
+		m.mu.Unlock()
+		return
+	}
+	id := m.queue[0]
+	m.queue = m.queue[1:]
+	m.mu.Unlock()
+	select {
+	case m.jobs <- id:
+	case <-m.stop:
+		m.mu.Lock()
+		m.running--
+		m.mu.Unlock()
+	}
+}
+
+func (m *Manager) removeQueuedLocked(id string) {
+	for index, queuedID := range m.queue {
+		if queuedID == id {
+			m.queue = append(m.queue[:index], m.queue[index+1:]...)
+			return
+		}
+	}
+}
+
+func (m *Manager) waitingCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.queue)
+}
+
+func (m *Manager) runningCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.running
 }
 
 func (m *Manager) execute(id string) {

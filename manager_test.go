@@ -82,8 +82,8 @@ func TestQueueFullRejectsWithoutUnboundedTasks(t *testing.T) {
 	if third.Status != StatusRejected {
 		t.Fatalf("third status = %q, want rejected", third.Status)
 	}
-	if got := len(manager.jobs); got != 1 {
-		t.Fatalf("queued jobs = %d, want 1", got)
+	if got := manager.waitingCount(); got != 1 {
+		t.Fatalf("waiting jobs = %d, want 1", got)
 	}
 
 	close(release)
@@ -241,6 +241,230 @@ func TestHTTPCancelRunningInvocation(t *testing.T) {
 		t.Fatalf("cancel status = %d, want %d", cancelResponse.Code, http.StatusOK)
 	}
 	waitForStatus(t, manager, invocation.ID, StatusCanceled)
+}
+
+func TestZeroQueueAcceptsFirstRequestImmediately(t *testing.T) {
+	store := newTestStore(t)
+	release := make(chan struct{})
+	registry := Registry{
+		"block": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			select {
+			case <-release:
+				return map[string]any{"ok": true}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	manager, err := NewManager(store, registry, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+
+	first, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000})
+	if err != nil {
+		manager.Stop()
+		t.Fatalf("first request was rejected with idle slot: %v", err)
+	}
+	second, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000})
+	if err != ErrQueueFull {
+		manager.Stop()
+		t.Fatalf("second error = %v, want ErrQueueFull", err)
+	}
+	if second.Status != StatusRejected {
+		manager.Stop()
+		t.Fatalf("second status = %q, want rejected", second.Status)
+	}
+	if got := manager.waitingCount(); got != 0 {
+		t.Fatalf("waiting = %d, want 0 for zero-size queue", got)
+	}
+	close(release)
+	waitForStatus(t, manager, first.ID, StatusSucceeded)
+	manager.Stop()
+
+	if got := manager.waitingCount(); got != 0 {
+		t.Fatalf("waiting after stop = %d, want 0", got)
+	}
+	if got := manager.runningCount(); got != 0 {
+		t.Fatalf("running after stop = %d, want 0", got)
+	}
+}
+
+func TestConcurrentSubmissionsRespectZeroQueue(t *testing.T) {
+	store := newTestStore(t)
+	release := make(chan struct{})
+	registry := Registry{
+		"block": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			select {
+			case <-release:
+				return map[string]any{"ok": true}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	manager, err := NewManager(store, registry, 2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(func() {
+		close(release)
+		manager.Stop()
+	})
+
+	const total = 16
+	type submitResult struct {
+		id     string
+		err    error
+		status string
+	}
+	results := make(chan submitResult, total)
+	var wg sync.WaitGroup
+	for i := 0; i < total; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			invocation, submitErr := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000})
+			results <- submitResult{id: invocation.ID, err: submitErr, status: invocation.Status}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	accepted, rejected := 0, 0
+	for result := range results {
+		if result.err == nil {
+			accepted++
+			if result.status != StatusQueued {
+				t.Fatalf("accepted request status = %q, want queued", result.status)
+			}
+			continue
+		}
+		if result.err != ErrQueueFull || result.status != StatusRejected {
+			t.Fatalf("result = %+v, want rejected ErrQueueFull", result)
+		}
+		rejected++
+	}
+	if accepted != 2 || rejected != total-2 {
+		t.Fatalf("accepted = %d, rejected = %d, want 2 and %d", accepted, rejected, total-2)
+	}
+	if got := manager.waitingCount(); got != 0 {
+		t.Fatalf("waiting = %d, want 0", got)
+	}
+}
+
+func TestImmediateCancelReleasesWaitingCapacity(t *testing.T) {
+	store := newTestStore(t)
+	release := make(chan struct{})
+	registry := Registry{
+		"block": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			select {
+			case <-release:
+				return map[string]any{"ok": true}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	manager, err := NewManager(store, registry, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(func() {
+		close(release)
+		manager.Stop()
+	})
+
+	running, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, running.ID, StatusRunning)
+	waiting, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	overflow, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000})
+	if err != ErrQueueFull {
+		t.Fatalf("overflow error = %v, want ErrQueueFull", err)
+	}
+	waitForStatus(t, manager, overflow.ID, StatusRejected)
+
+	canceled, transitioned, err := manager.Cancel(waiting.ID)
+	if err != nil || !transitioned {
+		t.Fatalf("cancel = %+v %v, want transition", canceled, err)
+	}
+	if got := manager.waitingCount(); got != 0 {
+		t.Fatalf("waiting after cancel = %d, want 0", got)
+	}
+	replacement, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000})
+	if err != nil {
+		t.Fatalf("replacement rejected: %v", err)
+	}
+	if got := manager.waitingCount(); got != 1 {
+		t.Fatalf("waiting = %d, want 1", got)
+	}
+	if _, _, err := manager.Cancel(replacement.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, canceled.ID, StatusCanceled)
+	waitForStatus(t, manager, replacement.ID, StatusCanceled)
+}
+
+func TestStopAndRestartReprocessesWaitingQueue(t *testing.T) {
+	dataPath := filepath.Join(t.TempDir(), "state.json")
+	registry := Registry{
+		"echo": echoFunction,
+		"wait": waitFunction,
+	}
+
+	firstStore, err := OpenStore(dataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstManager, err := NewManager(firstStore, registry, 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstManager.Start()
+	running, err := firstManager.Submit(InvokeRequest{Function: "wait", Argument: json.RawMessage(`{"ms":10000}`), TimeoutMs: 30000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitingOne, err := firstManager.Submit(InvokeRequest{Function: "echo", Argument: json.RawMessage(`{"text":"one"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitingTwo, err := firstManager.Submit(InvokeRequest{Function: "echo", Argument: json.RawMessage(`{"text":"two"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, firstManager, running.ID, StatusRunning)
+	firstManager.Stop()
+
+	secondStore, err := OpenStore(dataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondManager, err := NewManager(secondStore, registry, 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondManager.Start()
+	t.Cleanup(secondManager.Stop)
+
+	waitForStatus(t, secondManager, running.ID, StatusCanceled)
+	waitForStatus(t, secondManager, waitingOne.ID, StatusSucceeded)
+	waitForStatus(t, secondManager, waitingTwo.ID, StatusSucceeded)
+	if got := secondManager.waitingCount(); got != 0 {
+		t.Fatalf("waiting after restart drained = %d, want 0", got)
+	}
+	if got := secondManager.runningCount(); got != 0 {
+		t.Fatalf("running after restart drained = %d, want 0", got)
+	}
 }
 
 func itoa(value int) string {
