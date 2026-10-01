@@ -467,6 +467,210 @@ func TestStopAndRestartReprocessesWaitingQueue(t *testing.T) {
 	}
 }
 
+
+func blockingRegistry(started chan string, release chan struct{}) Registry {
+	return Registry{
+		"block": func(ctx context.Context, argument json.RawMessage) (any, error) {
+			var args map[string]string
+			if err := json.Unmarshal(argument, &args); err != nil {
+				return nil, err
+			}
+			if started != nil {
+				started <- args["id"]
+			}
+			select {
+			case <-release:
+				return map[string]any{"ok": true}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+}
+
+func TestCostAwareAdmissionAndZeroQueue(t *testing.T) {
+	store := newTestStore(t)
+	release := make(chan struct{})
+	manager, err := NewManager(store, blockingRegistry(nil, release), 3, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(manager.Stop)
+
+	heavy, err := manager.Submit(InvokeRequest{Function: "block", Cost: 2, TimeoutMs: 5000})
+	if err != nil {
+		t.Fatalf("heavy cost 2 rejected with 3 free units: %v", err)
+	}
+	light, err := manager.Submit(InvokeRequest{Function: "block", Cost: 1, TimeoutMs: 5000})
+	if err != nil {
+		t.Fatalf("light cost 1 rejected with 1 free unit: %v", err)
+	}
+	if _, err := manager.Submit(InvokeRequest{Function: "block", Cost: 1, TimeoutMs: 5000}); err != ErrQueueFull {
+		t.Fatalf("overflow error = %v, want ErrQueueFull", err)
+	}
+	if got := manager.Capacity(); got.Used != 3 || got.Running != 2 {
+		t.Fatalf("capacity = %+v, want used 3 running 2", got)
+	}
+	if _, err := manager.Submit(InvokeRequest{Function: "block", Cost: 4, TimeoutMs: 5000}); err == nil || err == ErrQueueFull {
+		t.Fatalf("cost above capacity error = %v, want validation error", err)
+	}
+	close(release)
+	waitForStatus(t, manager, heavy.ID, StatusSucceeded)
+	waitForStatus(t, manager, light.ID, StatusSucceeded)
+}
+
+func TestShrinkCapacityKeepsRunningOccupied(t *testing.T) {
+	store := newTestStore(t)
+	release := make(chan struct{})
+	manager, err := NewManager(store, blockingRegistry(nil, release), 2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(manager.Stop)
+
+	first, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, first.ID, StatusRunning)
+	waitForStatus(t, manager, second.ID, StatusRunning)
+
+	if err := manager.SetCapacity(1); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.Capacity(); got.Used != 2 {
+		t.Fatalf("used = %d after shrink, want 2 (running tasks still occupy)", got.Used)
+	}
+	if _, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000}); err != ErrQueueFull {
+		t.Fatalf("submit after shrink error = %v, want ErrQueueFull", err)
+	}
+	if err := manager.SetCapacity(3); err != nil {
+		t.Fatal(err)
+	}
+	third, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000})
+	if err != nil {
+		t.Fatalf("submit after grow: %v", err)
+	}
+	close(release)
+	waitForStatus(t, manager, first.ID, StatusSucceeded)
+	waitForStatus(t, manager, second.ID, StatusSucceeded)
+	waitForStatus(t, manager, third.ID, StatusSucceeded)
+	if got := manager.Capacity(); got.Used != 0 {
+		t.Fatalf("used = %d after drain, want 0", got.Used)
+	}
+}
+
+func TestHeavyTaskNotStarvedByLightStream(t *testing.T) {
+	store := newTestStore(t)
+	release := make(chan struct{})
+	manager, err := NewManager(store, blockingRegistry(nil, release), 2, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(manager.Stop)
+
+	first, err := manager.Submit(InvokeRequest{Function: "block", Group: "light", TimeoutMs: 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.Submit(InvokeRequest{Function: "block", Group: "light", TimeoutMs: 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, first.ID, StatusRunning)
+	waitForStatus(t, manager, second.ID, StatusRunning)
+
+	heavy, err := manager.Submit(InvokeRequest{Function: "block", Group: "heavy", Cost: 2, TimeoutMs: 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	piggy, err := manager.Submit(InvokeRequest{Function: "block", Group: "light", TimeoutMs: 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Free exactly one unit: the heavy task needs 2, so the free unit must
+	// be reserved for it instead of letting the queued light task jump in.
+	manager.Cancel(first.ID)
+	waitForStatus(t, manager, first.ID, StatusCanceled)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if got := manager.Capacity(); got.Used == 1 && got.Waiting == 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := manager.Capacity(); got.Used != 1 || got.Waiting != 2 {
+		t.Fatalf("capacity = %+v, want used 1 waiting 2 (unit reserved for heavy)", got)
+	}
+
+	manager.Cancel(second.ID)
+	waitForStatus(t, manager, second.ID, StatusCanceled)
+	waitForStatus(t, manager, heavy.ID, StatusRunning)
+	if got := manager.Capacity(); got.Used != 2 {
+		t.Fatalf("used = %d while heavy runs, want 2", got.Used)
+	}
+	close(release)
+	waitForStatus(t, manager, heavy.ID, StatusSucceeded)
+	waitForStatus(t, manager, piggy.ID, StatusSucceeded)
+	if got := manager.Capacity(); got.Used != 0 || got.Waiting != 0 {
+		t.Fatalf("capacity = %+v after drain, want zero", got)
+	}
+}
+
+func TestConcurrentCancelTimeoutAndCapacityChange(t *testing.T) {
+	store := newTestStore(t)
+	release := make(chan struct{})
+	manager, err := NewManager(store, blockingRegistry(nil, release), 2, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(manager.Stop)
+
+	running, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, running.ID, StatusRunning)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if i%2 == 0 {
+				_, _, _ = manager.Cancel(queued.ID)
+			} else {
+				_ = manager.SetCapacity(1 + i%3)
+			}
+		}(i)
+	}
+	wg.Wait()
+	waitForStatus(t, manager, running.ID, StatusTimedOut)
+	waitForStatus(t, manager, queued.ID, StatusCanceled)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got := manager.Capacity()
+		if got.Used == 0 && got.Running == 0 && got.Waiting == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("capacity leaked: %+v", manager.Capacity())
+}
+
 func itoa(value int) string {
 	if value == 0 {
 		return "0"

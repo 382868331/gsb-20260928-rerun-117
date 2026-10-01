@@ -17,11 +17,19 @@ go run . -addr :8080 -slots 2 -queue 4 -data data/state.json
 ## API
 
 - `GET /v1/functions`：列出内置函数。
-- `POST /v1/invocations`：提交调用，请求形如 `{"function":"add","argument":{"a":1,"b":2},"timeout_ms":1000}`。
+- `POST /v1/invocations`：提交调用，请求形如 `{"function":"add","argument":{"a":1,"b":2},"timeout_ms":1000,"cost":1,"group":"default"}`。
 - `GET /v1/invocations/{id}`：读取持久化调用记录。
 - `POST /v1/invocations/{id}/cancel`：取消排队中的调用，或请求取消运行中的可中断函数。
+- `GET /v1/capacity`：查看当前容量、已占用单元、运行与等待数量。
+- `PUT /v1/capacity`：运行期间调整总容量，请求形如 `{"capacity":4}`。
 
-槽位由固定数量 worker 控制；另有有界等待队列。运行槽位和队列都占满时，接口返回 `503`，状态记录为 `rejected`，不会继续创建执行任务。
+容量以单元计：每个任务通过 `cost` 声明占用的单元数（默认 1），运行期间真实占用这些单元。另有有界等待队列。可用容量不足且队列占满时，接口返回 `503`，状态记录为 `rejected`，不会继续创建执行任务。等待队列长度为零时，只接纳能够立即调度的任务。
+
+容量可在运行期间通过 `PUT /v1/capacity` 调整。缩容不会让正在执行的任务被凭空算作未占用：已占用单元只在任务真正结束时释放一次，后续接收与排队始终按真实剩余能力判断。
+
+等待任务按 `group` 分组公平调度：组间轮转、组内先进先出。当轮到某个任务但剩余容量不足以容纳其 `cost` 时，空闲单元会为它保留，持续到来的轻任务不能让一个合法重任务永久没有机会。`cost` 超过当前总容量的提交会被直接拒绝。
+
+等待取消、执行超时与容量变化可能同时发生；容量占用只在执行真正结束时释放一次，排队条目只在状态成功转移时移除一次，不会重复释放或重复占用。
 
 状态使用原子替换的 JSON 文件持久化。终态包括 `succeeded`、`failed`、`timed_out`、`canceled`、`rejected`。重启时上次处于 `running` 的请求无法确认外部观察结果，会明确标记为 `uncertain`；已完成记录保持不变，仍排队的记录会重新进入有界队列。
 

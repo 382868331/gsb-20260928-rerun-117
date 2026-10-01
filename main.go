@@ -16,7 +16,7 @@ import (
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
 	dataPath := flag.String("data", "data/state.json", "path to the durable state file")
-	slots := flag.Int("slots", 2, "maximum number of concurrently running functions")
+	slots := flag.Int("slots", 2, "total capacity units available for running functions")
 	queueSize := flag.Int("queue", 4, "maximum number of requests waiting for a slot")
 	flag.Parse()
 

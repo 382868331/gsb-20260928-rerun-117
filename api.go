@@ -15,6 +15,21 @@ func NewRouter(manager *Manager) http.Handler {
 	mux.HandleFunc("GET /v1/functions", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string][]string{"functions": manager.registry.Names()})
 	})
+	mux.HandleFunc("GET /v1/capacity", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, manager.Capacity())
+	})
+	mux.HandleFunc("PUT /v1/capacity", func(w http.ResponseWriter, r *http.Request) {
+		var request CapacityRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid JSON body"})
+			return
+		}
+		if err := manager.SetCapacity(request.Capacity); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, manager.Capacity())
+	})
 	mux.HandleFunc("POST /v1/invocations", func(w http.ResponseWriter, r *http.Request) {
 		var request InvokeRequest
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {

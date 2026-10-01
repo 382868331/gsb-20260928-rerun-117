@@ -17,6 +17,8 @@ type Invocation struct {
 	ID         string          `json:"id"`
 	Function   string          `json:"function"`
 	Argument   json.RawMessage `json:"argument,omitempty"`
+	Cost       int             `json:"cost"`
+	Group      string          `json:"group"`
 	TimeoutMs  int             `json:"timeout_ms"`
 	Status     string          `json:"status"`
 	Result     json.RawMessage `json:"result,omitempty"`
@@ -30,7 +32,21 @@ type Invocation struct {
 type InvokeRequest struct {
 	Function  string          `json:"function"`
 	Argument  json.RawMessage `json:"argument"`
+	Cost      int             `json:"cost,omitempty"`
+	Group     string          `json:"group,omitempty"`
 	TimeoutMs int             `json:"timeout_ms"`
+}
+
+type CapacityRequest struct {
+	Capacity int `json:"capacity"`
+}
+
+type CapacityResponse struct {
+	Capacity  int `json:"capacity"`
+	Used      int `json:"used"`
+	Running   int `json:"running"`
+	Waiting   int `json:"waiting"`
+	QueueSize int `json:"queue_size"`
 }
 
 type InvokeResponse struct {

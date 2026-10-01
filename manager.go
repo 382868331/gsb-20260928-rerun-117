@@ -14,26 +14,37 @@ import (
 
 var ErrQueueFull = errors.New("execution queue is full")
 
-type Manager struct {
-	store       *Store
-	registry    Registry
-	workerCount int
-	slots       int
-	queueSize   int
-	jobs        chan string
+const defaultGroup = "default"
 
-	mu       sync.Mutex
-	cancels  map[string]context.CancelFunc
-	running  int
-	queue    []string
-	stopping bool
-	stop     chan struct{}
-	wg       sync.WaitGroup
+type queuedTask struct {
+	id    string
+	group string
+	cost  int
 }
 
-func NewManager(store *Store, registry Registry, slots, queueSize int) (*Manager, error) {
-	if slots <= 0 {
-		slots = 1
+// Manager schedules invocations against a unit-based capacity. Each task
+// occupies cost units while running; queued tasks wait for enough free
+// units. Capacity can be resized at runtime; shrinking never pretends
+// running tasks are free, so used may temporarily exceed capacity.
+type Manager struct {
+	store     *Store
+	registry  Registry
+	queueSize int
+
+	mu        sync.Mutex
+	capacity  int
+	used      int
+	running   map[string]int
+	cancels   map[string]context.CancelFunc
+	queue     []queuedTask
+	lastGroup string
+	stopping  bool
+	wg        sync.WaitGroup
+}
+
+func NewManager(store *Store, registry Registry, capacity, queueSize int) (*Manager, error) {
+	if capacity <= 0 {
+		capacity = 1
 	}
 	if queueSize < 0 {
 		queueSize = 0
@@ -42,23 +53,17 @@ func NewManager(store *Store, registry Registry, slots, queueSize int) (*Manager
 		return nil, err
 	}
 	manager := &Manager{
-		store:       store,
-		registry:    registry,
-		workerCount: slots,
-		slots:       slots,
-		queueSize:   queueSize,
-		jobs:        make(chan string, slots),
-		cancels:     make(map[string]context.CancelFunc),
-		stop:        make(chan struct{}),
+		store:     store,
+		registry:  registry,
+		capacity:  capacity,
+		queueSize: queueSize,
+		running:   make(map[string]int),
+		cancels:   make(map[string]context.CancelFunc),
 	}
 	return manager, nil
 }
 
 func (m *Manager) Start() {
-	for i := 0; i < m.workerCount; i++ {
-		m.wg.Add(1)
-		go m.worker()
-	}
 	queued := m.store.QueuedRecords()
 	sort.Slice(queued, func(i, j int) bool {
 		if queued[i].CreatedAt != queued[j].CreatedAt {
@@ -67,10 +72,24 @@ func (m *Manager) Start() {
 		return queued[i].ID < queued[j].ID
 	})
 	for _, record := range queued {
-		if !m.dispatch(record.ID) {
+		cost, group := normalizedCostGroup(record.Cost, record.Group)
+		m.mu.Lock()
+		admitted := m.admitLocked(record.ID, group, cost)
+		m.mu.Unlock()
+		if !admitted {
 			m.finishRejected(record.ID, "execution queue is full after restart")
 		}
 	}
+}
+
+func normalizedCostGroup(cost int, group string) (int, string) {
+	if cost <= 0 {
+		cost = 1
+	}
+	if group == "" {
+		group = defaultGroup
+	}
+	return cost, group
 }
 
 func (m *Manager) Submit(req InvokeRequest) (Invocation, error) {
@@ -80,6 +99,10 @@ func (m *Manager) Submit(req InvokeRequest) (Invocation, error) {
 	if _, ok := m.registry.Get(req.Function); !ok {
 		return Invocation{}, fmt.Errorf("unknown function %q", req.Function)
 	}
+	if req.Cost < 0 {
+		return Invocation{}, errors.New("cost must be non-negative")
+	}
+	cost, group := normalizedCostGroup(req.Cost, req.Group)
 	timeoutMs := req.TimeoutMs
 	if timeoutMs <= 0 {
 		timeoutMs = 5000
@@ -96,18 +119,107 @@ func (m *Manager) Submit(req InvokeRequest) (Invocation, error) {
 		ID:        newID(),
 		Function:  req.Function,
 		Argument:  argument,
+		Cost:      cost,
+		Group:     group,
 		TimeoutMs: timeoutMs,
 		Status:    StatusQueued,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+	m.mu.Lock()
+	capacity := m.capacity
+	m.mu.Unlock()
+	if cost > capacity {
+		return Invocation{}, fmt.Errorf("cost %d exceeds current capacity %d", cost, capacity)
+	}
 	if err := m.store.Create(record); err != nil {
 		return Invocation{}, err
 	}
-	if !m.dispatch(record.ID) {
+	m.mu.Lock()
+	admitted := m.admitLocked(record.ID, group, cost)
+	m.mu.Unlock()
+	if !admitted {
 		return m.finishRejected(record.ID, "execution queue is full")
 	}
 	return record, nil
+}
+
+// admitLocked either starts the task immediately or appends it to the
+// bounded waiting queue. With a zero-size queue only tasks that can be
+// scheduled right now are accepted.
+func (m *Manager) admitLocked(id, group string, cost int) bool {
+	if m.stopping {
+		return false
+	}
+	if len(m.queue) == 0 && m.used+cost <= m.capacity {
+		m.startLocked(id, cost)
+		return true
+	}
+	if len(m.queue) >= m.queueSize {
+		return false
+	}
+	m.queue = append(m.queue, queuedTask{id: id, group: group, cost: cost})
+	return true
+}
+
+func (m *Manager) startLocked(id string, cost int) {
+	m.used += cost
+	m.running[id] = cost
+	m.wg.Add(1)
+	go m.execute(id, cost)
+}
+
+// scheduleLocked dispatches queued tasks while capacity allows. The next
+// candidate is chosen fairly across groups (round-robin over the groups
+// currently waiting, FIFO within a group). If the chosen task does not fit
+// in the remaining capacity, the free units are reserved for it and nothing
+// else is dispatched, so a steady stream of light tasks cannot starve a
+// legitimate heavy task.
+func (m *Manager) scheduleLocked() {
+	for {
+		index := m.pickLocked()
+		if index < 0 {
+			return
+		}
+		task := m.queue[index]
+		m.queue = append(m.queue[:index], m.queue[index+1:]...)
+		m.startLocked(task.id, task.cost)
+	}
+}
+
+func (m *Manager) pickLocked() int {
+	if len(m.queue) == 0 {
+		return -1
+	}
+	groups := make([]string, 0, len(m.queue))
+	seen := make(map[string]bool)
+	for _, task := range m.queue {
+		if !seen[task.group] {
+			seen[task.group] = true
+			groups = append(groups, task.group)
+		}
+	}
+	start := 0
+	for i, group := range groups {
+		if group == m.lastGroup {
+			start = i + 1
+			break
+		}
+	}
+	for offset := 0; offset < len(groups); offset++ {
+		group := groups[(start+offset)%len(groups)]
+		for index, task := range m.queue {
+			if task.group != group {
+				continue
+			}
+			if m.used+task.cost > m.capacity {
+				return -1
+			}
+			m.lastGroup = group
+			return index
+		}
+	}
+	return -1
 }
 
 func (m *Manager) Get(id string) (Invocation, bool) {
@@ -146,60 +258,32 @@ func (m *Manager) Cancel(id string) (Invocation, bool, error) {
 	}
 }
 
-func (m *Manager) dispatch(id string) bool {
+func (m *Manager) SetCapacity(capacity int) error {
+	if capacity < 0 {
+		return errors.New("capacity must be non-negative")
+	}
+	m.mu.Lock()
+	m.capacity = capacity
+	m.scheduleLocked()
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *Manager) Capacity() CapacityResponse {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.stopping || m.running+len(m.queue) >= m.slots+m.queueSize {
-		return false
-	}
-	if m.running < m.slots {
-		select {
-		case m.jobs <- id:
-			m.running++
-			return true
-		case <-m.stop:
-			return false
-		}
-	}
-	m.queue = append(m.queue, id)
-	return true
-}
-
-func (m *Manager) worker() {
-	defer m.wg.Done()
-	for {
-		select {
-		case <-m.stop:
-			return
-		case id := <-m.jobs:
-			m.execute(id)
-			m.pullNext()
-		}
-	}
-}
-
-func (m *Manager) pullNext() {
-	m.mu.Lock()
-	if len(m.queue) == 0 {
-		m.running--
-		m.mu.Unlock()
-		return
-	}
-	id := m.queue[0]
-	m.queue = m.queue[1:]
-	m.mu.Unlock()
-	select {
-	case m.jobs <- id:
-	case <-m.stop:
-		m.mu.Lock()
-		m.running--
-		m.mu.Unlock()
+	return CapacityResponse{
+		Capacity:  m.capacity,
+		Used:      m.used,
+		Running:   len(m.running),
+		Waiting:   len(m.queue),
+		QueueSize: m.queueSize,
 	}
 }
 
 func (m *Manager) removeQueuedLocked(id string) {
-	for index, queuedID := range m.queue {
-		if queuedID == id {
+	for index, task := range m.queue {
+		if task.id == id {
 			m.queue = append(m.queue[:index], m.queue[index+1:]...)
 			return
 		}
@@ -215,10 +299,19 @@ func (m *Manager) waitingCount() int {
 func (m *Manager) runningCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.running
+	return len(m.running)
 }
 
-func (m *Manager) execute(id string) {
+func (m *Manager) execute(id string, cost int) {
+	defer func() {
+		m.mu.Lock()
+		delete(m.running, id)
+		delete(m.cancels, id)
+		m.used -= cost
+		m.scheduleLocked()
+		m.mu.Unlock()
+		m.wg.Done()
+	}()
 	record, ok, err := m.store.Transition(id, StatusQueued, StatusRunning, func(next *Invocation) {
 		next.StartedAt = nowRFC3339()
 		next.UpdatedAt = next.StartedAt
@@ -257,15 +350,9 @@ func (m *Manager) execute(id string) {
 			errMessage = "execution canceled"
 			terminalStatus = StatusCanceled
 		}
-		m.mu.Lock()
-		delete(m.cancels, id)
-		m.mu.Unlock()
 		m.markTerminal(id, terminalStatus, nil, errMessage)
 		return
 	}
-	m.mu.Lock()
-	delete(m.cancels, id)
-	m.mu.Unlock()
 	if output.err != nil {
 		if errors.Is(output.err, context.DeadlineExceeded) {
 			m.markTerminal(id, StatusTimedOut, nil, "execution timed out")
@@ -289,16 +376,13 @@ func (m *Manager) markFailed(id, message string) {
 }
 
 func (m *Manager) finishRejected(id, message string) (Invocation, error) {
-	updated, transitioned, err := m.store.Transition(id, StatusQueued, StatusRejected, func(next *Invocation) {
+	updated, _, err := m.store.Transition(id, StatusQueued, StatusRejected, func(next *Invocation) {
 		next.Error = message
 		next.FinishedAt = nowRFC3339()
 		next.UpdatedAt = next.FinishedAt
 	})
 	if err != nil {
 		return Invocation{}, err
-	}
-	if !transitioned {
-		return updated, ErrQueueFull
 	}
 	return updated, ErrQueueFull
 }
@@ -314,8 +398,12 @@ func (m *Manager) markTerminal(id, status string, result json.RawMessage, messag
 
 func (m *Manager) Stop() {
 	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		m.wg.Wait()
+		return
+	}
 	m.stopping = true
-	close(m.stop)
 	cancels := make([]context.CancelFunc, 0, len(m.cancels))
 	for _, cancel := range m.cancels {
 		cancels = append(cancels, cancel)
