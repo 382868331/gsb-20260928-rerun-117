@@ -478,3 +478,271 @@ func itoa(value int) string {
 	}
 	return string(digits)
 }
+
+func blockingRegistry(started chan string, release chan struct{}) Registry {
+	return Registry{
+		"block": func(ctx context.Context, argument json.RawMessage) (any, error) {
+			var args map[string]string
+			_ = json.Unmarshal(argument, &args)
+			if started != nil {
+				started <- args["id"]
+			}
+			select {
+			case <-release:
+				return map[string]any{"ok": true}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+}
+
+func TestWeightedAdmissionAndShrinkKeepsRunning(t *testing.T) {
+	store := newTestStore(t)
+	started := make(chan string, 8)
+	release := make(chan struct{})
+	manager, err := NewManager(store, blockingRegistry(started, release), 4, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(func() {
+		close(release)
+		manager.Stop()
+	})
+
+	heavy, err := manager.Submit(InvokeRequest{Function: "block", Weight: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	light, err := manager.Submit(InvokeRequest{Function: "block", Weight: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	queued, err := manager.Submit(InvokeRequest{Function: "block", Weight: 2})
+	if err != nil {
+		t.Fatalf("bounded queue should accept the heavy task: %v", err)
+	}
+	if got := manager.waitingCount(); got != 1 {
+		t.Fatalf("waiting = %d, want 1", got)
+	}
+	if _, err := manager.Submit(InvokeRequest{Function: "block", Weight: 1}); err != ErrQueueFull {
+		t.Fatalf("expected rejection when queue is full, got %v", err)
+	}
+	if err := manager.SetCapacity(2); err != nil {
+		t.Fatal(err)
+	}
+	capacity, running, available := manager.Capacity()
+	if capacity != 2 || running != 4 || available != -2 {
+		t.Fatalf("capacity=%d running=%d available=%d, want 2/4/-2", capacity, running, available)
+	}
+	if got := manager.runningCount(); got != 2 {
+		t.Fatalf("running after shrink = %d, want 2 (shrink must not kill tasks)", got)
+	}
+	if _, err := manager.Submit(InvokeRequest{Function: "block", Weight: 1}); err != ErrQueueFull {
+		t.Fatalf("expected rejection while over capacity, got %v", err)
+	}
+	close(release)
+	waitForStatus(t, manager, heavy.ID, StatusSucceeded)
+	waitForStatus(t, manager, light.ID, StatusSucceeded)
+	waitForStatus(t, manager, queued.ID, StatusSucceeded)
+	release = make(chan struct{})
+}
+
+func TestCapacityGrowthUnblocksQueuedHeavyTask(t *testing.T) {
+	store := newTestStore(t)
+	started := make(chan string, 8)
+	release := make(chan struct{})
+	manager, err := NewManager(store, blockingRegistry(started, release), 2, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(func() {
+		close(release)
+		manager.Stop()
+	})
+
+	first, err := manager.Submit(InvokeRequest{Function: "block", Weight: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	heavy, err := manager.Submit(InvokeRequest{Function: "block", Weight: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.waitingCount(); got != 1 {
+		t.Fatalf("waiting = %d, want 1", got)
+	}
+	if err := manager.SetCapacity(4); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	waitForStatus(t, manager, heavy.ID, StatusRunning)
+	close(release)
+	waitForStatus(t, manager, first.ID, StatusSucceeded)
+	waitForStatus(t, manager, heavy.ID, StatusSucceeded)
+	release = make(chan struct{})
+}
+
+func TestHeavyTaskNotStarvedByLightStream(t *testing.T) {
+	store := newTestStore(t)
+	release := make(chan struct{})
+	var gateMu sync.Mutex
+	gate := release
+	registry := Registry{
+		"block": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			gateMu.Lock()
+			current := gate
+			gateMu.Unlock()
+			select {
+			case <-current:
+				return map[string]any{"ok": true}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	manager, err := NewManager(store, registry, 2, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(manager.Stop)
+
+	first, err := manager.Submit(InvokeRequest{Function: "block", Weight: 1, Group: "light"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, first.ID, StatusRunning)
+	heavy, err := manager.Submit(InvokeRequest{Function: "block", Weight: 2, Group: "heavy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lights []string
+	for i := 0; i < 6; i++ {
+		light, err := manager.Submit(InvokeRequest{Function: "block", Weight: 1, Group: "light"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		lights = append(lights, light.ID)
+	}
+	close(release)
+	waitForStatus(t, manager, first.ID, StatusSucceeded)
+	waitForStatus(t, manager, heavy.ID, StatusSucceeded)
+	gateMu.Lock()
+	gate = make(chan struct{})
+	close(gate)
+	gateMu.Unlock()
+	for _, id := range lights {
+		waitForStatus(t, manager, id, StatusSucceeded)
+	}
+}
+
+func TestCancelTimeoutCapacityRaceReleasesOnce(t *testing.T) {
+	store := newTestStore(t)
+	registry := Registry{
+		"wait": waitFunction,
+	}
+	manager, err := NewManager(store, registry, 2, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(manager.Stop)
+
+	var ids []string
+	for i := 0; i < 4; i++ {
+		invocation, err := manager.Submit(InvokeRequest{
+			Function:  "wait",
+			Argument:  json.RawMessage(`{"ms":80}`),
+			TimeoutMs: 60,
+			Weight:    1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, invocation.ID)
+	}
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			_, _, _ = manager.Cancel(id)
+		}(id)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			_ = manager.SetCapacity(1 + i%4)
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	wg.Wait()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_, running, _ := manager.Capacity()
+		if running == 0 && manager.waitingCount() == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	_, running, _ := manager.Capacity()
+	if running != 0 {
+		t.Fatalf("running weight after all terminals = %d, want 0", running)
+	}
+	if got := manager.waitingCount(); got != 0 {
+		t.Fatalf("waiting after all terminals = %d, want 0", got)
+	}
+	for _, id := range ids {
+		record, _ := manager.Get(id)
+		switch record.Status {
+		case StatusSucceeded, StatusTimedOut, StatusCanceled:
+		default:
+			t.Fatalf("invocation %s status = %q, want terminal", id, record.Status)
+		}
+	}
+	if err := manager.SetCapacity(2); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestZeroQueueOnlyAdmitsImmediatelySchedulable(t *testing.T) {
+	store := newTestStore(t)
+	started := make(chan string, 4)
+	release := make(chan struct{})
+	manager, err := NewManager(store, blockingRegistry(started, release), 2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(func() {
+		close(release)
+		manager.Stop()
+	})
+
+	first, err := manager.Submit(InvokeRequest{Function: "block", Weight: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if _, err := manager.Submit(InvokeRequest{Function: "block", Weight: 1}); err != ErrQueueFull {
+		t.Fatalf("error = %v, want ErrQueueFull with zero queue and no capacity", err)
+	}
+	close(release)
+	waitForStatus(t, manager, first.ID, StatusSucceeded)
+	second, err := manager.Submit(InvokeRequest{Function: "block", Weight: 1})
+	if err != nil {
+		t.Fatalf("immediate scheduling after release failed: %v", err)
+	}
+	<-started
+	release = make(chan struct{})
+	close(release)
+	waitForStatus(t, manager, second.ID, StatusSucceeded)
+	release = make(chan struct{})
+}

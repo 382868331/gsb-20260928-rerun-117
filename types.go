@@ -17,6 +17,8 @@ type Invocation struct {
 	ID         string          `json:"id"`
 	Function   string          `json:"function"`
 	Argument   json.RawMessage `json:"argument,omitempty"`
+	Weight     int             `json:"weight"`
+	Group      string          `json:"group"`
 	TimeoutMs  int             `json:"timeout_ms"`
 	Status     string          `json:"status"`
 	Result     json.RawMessage `json:"result,omitempty"`
@@ -30,6 +32,8 @@ type Invocation struct {
 type InvokeRequest struct {
 	Function  string          `json:"function"`
 	Argument  json.RawMessage `json:"argument"`
+	Weight    int             `json:"weight"`
+	Group     string          `json:"group"`
 	TimeoutMs int             `json:"timeout_ms"`
 }
 

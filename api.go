@@ -15,6 +15,35 @@ func NewRouter(manager *Manager) http.Handler {
 	mux.HandleFunc("GET /v1/functions", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string][]string{"functions": manager.registry.Names()})
 	})
+	mux.HandleFunc("GET /v1/capacity", func(w http.ResponseWriter, _ *http.Request) {
+		capacity, running, available := manager.Capacity()
+		writeJSON(w, http.StatusOK, map[string]int{
+			"capacity":  capacity,
+			"running":   running,
+			"available": available,
+			"queued":    manager.waitingCount(),
+		})
+	})
+	mux.HandleFunc("PUT /v1/capacity", func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Capacity int `json:"capacity"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid JSON body"})
+			return
+		}
+		if err := manager.SetCapacity(request.Capacity); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+			return
+		}
+		capacity, running, available := manager.Capacity()
+		writeJSON(w, http.StatusOK, map[string]int{
+			"capacity":  capacity,
+			"running":   running,
+			"available": available,
+			"queued":    manager.waitingCount(),
+		})
+	})
 	mux.HandleFunc("POST /v1/invocations", func(w http.ResponseWriter, r *http.Request) {
 		var request InvokeRequest
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {

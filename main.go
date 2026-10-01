@@ -16,8 +16,8 @@ import (
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
 	dataPath := flag.String("data", "data/state.json", "path to the durable state file")
-	slots := flag.Int("slots", 2, "maximum number of concurrently running functions")
-	queueSize := flag.Int("queue", 4, "maximum number of requests waiting for a slot")
+	capacity := flag.Int("capacity", 2, "total resource capacity available to running functions")
+	queueSize := flag.Int("queue", 4, "maximum number of requests waiting for capacity")
 	flag.Parse()
 
 	store, err := OpenStore(*dataPath)
@@ -26,7 +26,7 @@ func main() {
 	}
 
 	registry := DefaultRegistry()
-	manager, err := NewManager(store, registry, *slots, *queueSize)
+	manager, err := NewManager(store, registry, *capacity, *queueSize)
 	if err != nil {
 		log.Fatalf("initialize execution manager: %v", err)
 	}

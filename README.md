@@ -5,7 +5,7 @@ Go 标准库实现的本地函数执行平台。它只运行进程内注册表�
 ## 运行
 
 ```bash
-go run . -addr :8080 -slots 2 -queue 4 -data data/state.json
+go run . -addr :8080 -capacity 4 -queue 4 -data data/state.json
 ```
 
 内置函数：
@@ -17,11 +17,15 @@ go run . -addr :8080 -slots 2 -queue 4 -data data/state.json
 ## API
 
 - `GET /v1/functions`：列出内置函数。
-- `POST /v1/invocations`：提交调用，请求形如 `{"function":"add","argument":{"a":1,"b":2},"timeout_ms":1000}`。
+- `POST /v1/invocations`：提交调用，请求形如 `{"function":"add","argument":{"a":1,"b":2},"weight":1,"group":"default","timeout_ms":1000}`。
 - `GET /v1/invocations/{id}`：读取持久化调用记录。
 - `POST /v1/invocations/{id}/cancel`：取消排队中的调用，或请求取消运行中的可中断函数。
+- `GET /v1/capacity`：查看总容量、运行中占用权重、真实剩余容量与排队数。
+- `PUT /v1/capacity`：运行期间调整可用容量，请求形如 `{"capacity":8}`。
 
-槽位由固定数量 worker 控制；另有有界等待队列。运行槽位和队列都占满时，接口返回 `503`，状态记录为 `rejected`，不会继续创建执行任务。
+每个任务携带权重 `weight`（默认 1）与任务组 `group`（默认 `default`）。容量按权重计量：运行中权重之和不超过当前容量时才调度新任务。缩容不会终止或“凭空释放”已在执行的任务，剩余容量可以为负，后续接收与排队都按真实剩余能力判断；扩容会立即唤醒能够放下的排队任务。等待队列为有界队列，队列占满时接口返回 `503`，状态记录为 `rejected`；等待队列长度为零时，只接纳能够立即安排的任务。
+
+调度按任务组轮转（round-robin）选取各组队首，保证组间公平等待；同时队列中最老的任务充当防饥饿哨兵：只要它放不下，排在它之后的任务就不得抢占容量，因此持续到来的轻任务无法让合法重任务（权重不超过容量）永久等待。等待取消、执行超时与容量调整并发发生时，任务权重只在执行协程中释放一次，不会重复释放或重复占用。
 
 状态使用原子替换的 JSON 文件持久化。终态包括 `succeeded`、`failed`、`timed_out`、`canceled`、`rejected`。重启时上次处于 `running` 的请求无法确认外部观察结果，会明确标记为 `uncertain`；已完成记录保持不变，仍排队的记录会重新进入有界队列。
 
