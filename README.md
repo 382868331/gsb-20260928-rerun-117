@@ -20,6 +20,7 @@ go run . -addr :8080 -slots 2 -queue 4 -data data/state.json
 - `POST /v1/invocations`：提交调用，请求形如 `{"function":"add","argument":{"a":1,"b":2},"timeout_ms":1000,"cost":1,"group":"default"}`。
 - 可通过 `dependencies` 声明前置调用及所需产物，例如 `"dependencies":[{"invocation_id":"...","artifacts":["sum"]}]`；`artifacts` 为空表示需要整个结果。
 - `GET /v1/invocations/{id}`：读取持久化调用记录。
+- 等待中的记录通过 `waiting` 提供逐项核对结果：`kind` 区分 `dependencies` 与 `capacity`，`dependencies` 中逐项给出前置状态、缺失或失败原因、SHA-256 依据和最近核对时间；容量等待只写入 `capacity`。
 - `POST /v1/invocations/{id}/cancel`：取消排队中的调用，或请求取消运行中的可中断函数。
 - `PUT /v1/invocations/{id}/result`：操作者把 `failed`、`timed_out`、`canceled` 或 `uncertain` 的前置结果人工替换为可用 JSON。
 - `GET /v1/capacity`：查看当前容量、已占用单元、运行与等待数量。
@@ -27,9 +28,9 @@ go run . -addr :8080 -slots 2 -queue 4 -data data/state.json
 
 容量以单元计：每个任务通过 `cost` 声明占用的单元数（默认 1），运行期间真实占用这些单元。另有有界等待队列。可用容量不足且队列占满时，接口返回 `503`，状态记录为 `rejected`，不会继续创建执行任务。等待队列长度为零时，只接纳能够立即调度的任务。
 
-未满足前置条件的任务记录为 `blocked`，只进入无成本的依赖等待集合，不预占执行单元，也不会进入有界容量队列。`GET /v1/capacity` 分别返回 `waiting_dependencies` 和 `waiting_capacity`：前者仍在等待前置成功及所需产物，后者已经通过前置核对、正在等待执行容量。依赖恰好解锁但容量队列暂满时，任务仍保留在依赖等待集合中，直到有准入空位。
+未满足前置条件的任务记录为 `blocked`，只进入无成本的依赖等待集合，不预占执行单元，也不会进入有界容量队列。`GET /v1/capacity` 分别返回 `waiting_dependencies` 和 `waiting_capacity`：前者仍在等待前置成功及所需产物，后者已经通过前置核对、正在等待执行容量。依赖恰好解锁但容量队列暂满时，任务仍保留在依赖等待集合中，直到有准入空位；此时 `waiting.kind` 为 `capacity`，不会再保留失败前置的旧原因。
 
-只有前置状态为 `succeeded` 且请求的每个产物都存在时，后续任务才会把前置结果的 SHA-256 依据快照写入 `dependency_basis` 并进入容量准入。前置为 `failed`、`canceled`、`timed_out` 或重启后的 `uncertain` 时，系统不会自动重放前置效果；后续任务保持 `blocked` 并说明需要人工确认。操作者替换失败或未知前置的结果后，等待它的任务会重新核对产物和依据；已经在容量队列中但依据已变化的后续任务会退回 `blocked`，不能带着旧依据启动。
+只有前置状态为 `succeeded` 且请求的每个产物都存在时，后续任务才会把前置结果的 SHA-256 依据快照写入 `dependency_basis` 并进入容量准入。前置为 `failed`、`canceled`、`timed_out` 或重启后的 `uncertain` 时，系统不会自动重放前置效果；后续任务保持 `blocked` 并逐项说明需要人工确认。操作者替换失败或未知前置的结果后，等待它的任务会立即重新核对产物、状态和依据；已经在容量队列中但依据已变化的后续任务会退回 `blocked`，不能带着旧依据启动。取消、进入执行/终态、保存重开或动态调整容量时，旧等待说明都会随当前状态刷新或清除。
 
 同一批任务中彼此独立的分支不受失败前置影响，可继续占用容量并完成。菱形依赖中两个前置都成功且产物可用后，汇合任务才进入容量队列；成本、组间轮转和重任务空闲单元保留规则仍然作用于准入之后，不会因为一批依赖同时解锁而绕过。
 

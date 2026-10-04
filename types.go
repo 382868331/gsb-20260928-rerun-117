@@ -19,6 +19,30 @@ type Dependency struct {
 	Artifacts    []string `json:"artifacts,omitempty"`
 }
 
+type DependencyWait struct {
+	InvocationID          string   `json:"invocation_id"`
+	Artifacts             []string `json:"artifacts,omitempty"`
+	Ready                 bool     `json:"ready"`
+	Reason                string   `json:"reason,omitempty"`
+	PrerequisiteStatus    string   `json:"prerequisite_status,omitempty"`
+	PrerequisiteUpdatedAt string   `json:"prerequisite_updated_at,omitempty"`
+	Basis                 string   `json:"basis,omitempty"`
+	LastCheckedAt         string   `json:"last_checked_at"`
+}
+
+type CapacityWait struct {
+	Waiting       bool   `json:"waiting"`
+	Reason        string `json:"reason,omitempty"`
+	LastCheckedAt string `json:"last_checked_at,omitempty"`
+}
+
+type WaitingState struct {
+	Kind          string           `json:"kind,omitempty"`
+	Dependencies  []DependencyWait `json:"dependencies,omitempty"`
+	Capacity      *CapacityWait    `json:"capacity,omitempty"`
+	LastCheckedAt string           `json:"last_checked_at,omitempty"`
+}
+
 type Invocation struct {
 	ID              string            `json:"id"`
 	Function        string            `json:"function"`
@@ -28,6 +52,7 @@ type Invocation struct {
 	TimeoutMs       int               `json:"timeout_ms"`
 	Dependencies    []Dependency      `json:"dependencies,omitempty"`
 	DependencyBasis map[string]string `json:"dependency_basis,omitempty"`
+	Waiting         *WaitingState     `json:"waiting,omitempty"`
 	Status          string            `json:"status"`
 	Result          json.RawMessage   `json:"result,omitempty"`
 	Error           string            `json:"error,omitempty"`
@@ -76,6 +101,18 @@ type ErrorResponse struct {
 
 func (r *Invocation) Clone() Invocation {
 	copyValue := *r
+	if r.Dependencies != nil {
+		copyValue.Dependencies = append([]Dependency(nil), r.Dependencies...)
+	}
+	if r.DependencyBasis != nil {
+		copyValue.DependencyBasis = make(map[string]string, len(r.DependencyBasis))
+		for key, value := range r.DependencyBasis {
+			copyValue.DependencyBasis[key] = value
+		}
+	}
+	if r.Waiting != nil {
+		copyValue.Waiting = cloneWaitingState(r.Waiting)
+	}
 	if r.Argument != nil {
 		copyValue.Argument = append(json.RawMessage(nil), r.Argument...)
 	}
@@ -83,4 +120,22 @@ func (r *Invocation) Clone() Invocation {
 		copyValue.Result = append(json.RawMessage(nil), r.Result...)
 	}
 	return copyValue
+}
+
+func cloneWaitingState(waiting *WaitingState) *WaitingState {
+	copyValue := *waiting
+	if waiting.Dependencies != nil {
+		copyValue.Dependencies = make([]DependencyWait, len(waiting.Dependencies))
+		for index, dependency := range waiting.Dependencies {
+			copyValue.Dependencies[index] = dependency
+			if dependency.Artifacts != nil {
+				copyValue.Dependencies[index].Artifacts = append([]string(nil), dependency.Artifacts...)
+			}
+		}
+	}
+	if waiting.Capacity != nil {
+		capacity := *waiting.Capacity
+		copyValue.Capacity = &capacity
+	}
+	return &copyValue
 }

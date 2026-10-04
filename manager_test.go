@@ -720,7 +720,18 @@ func TestDiamondDependenciesKeepIndependentBranchRunning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForStatus(t, manager, join.ID, StatusBlocked)
+	joinBlocked := waitForStatus(t, manager, join.ID, StatusBlocked)
+	if joinBlocked.Waiting == nil || joinBlocked.Waiting.Kind != "dependencies" || len(joinBlocked.Waiting.Dependencies) != 2 {
+		t.Fatalf("waiting state = %+v, want two per-dependency checks", joinBlocked.Waiting)
+	}
+	leftWait := joinBlocked.Waiting.Dependencies[0]
+	rightWait := joinBlocked.Waiting.Dependencies[1]
+	if !leftWait.Ready || leftWait.Basis == "" || leftWait.LastCheckedAt == "" {
+		t.Fatalf("successful dependency wait = %+v, want basis and checked time", leftWait)
+	}
+	if rightWait.Ready || rightWait.PrerequisiteStatus != StatusFailed || rightWait.Reason == "" || rightWait.LastCheckedAt == "" {
+		t.Fatalf("failed dependency wait = %+v, want item-specific failure reason", rightWait)
+	}
 	waitForStatus(t, manager, independent.ID, StatusRunning)
 	secondIndependent, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000})
 	if err != nil {
@@ -736,10 +747,22 @@ func TestDiamondDependenciesKeepIndependentBranchRunning(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("replace result = %+v %v, ok=%v", replaced, err, ok)
 	}
+	joinReady, _ := manager.Get(join.ID)
+	if joinReady.Waiting == nil || joinReady.Waiting.Kind != "capacity" {
+		t.Fatalf("waiting after replacement = %+v, want capacity wait", joinReady.Waiting)
+	}
+	for _, dependencyWait := range joinReady.Waiting.Dependencies {
+		if !dependencyWait.Ready || dependencyWait.Basis == "" || dependencyWait.PrerequisiteStatus != StatusSucceeded {
+			t.Fatalf("dependency wait after replacement = %+v, want fresh successful basis", dependencyWait)
+		}
+	}
 	close(release)
 	waitForStatus(t, manager, join.ID, StatusSucceeded)
 	waitForStatus(t, manager, secondIndependent.ID, StatusSucceeded)
 	joinRecord, _ := manager.Get(join.ID)
+	if joinRecord.Waiting != nil {
+		t.Fatalf("completed invocation retained waiting state: %+v", joinRecord.Waiting)
+	}
 	if len(joinRecord.DependencyBasis) != 2 {
 		t.Fatalf("dependency basis = %+v, want both prerequisites", joinRecord.DependencyBasis)
 	}
@@ -786,12 +809,24 @@ func TestDependencyAndCapacityWaitersSeparatedDuringCancelAndResize(t *testing.T
 		t.Fatal(err)
 	}
 	waitForStatus(t, manager, dependent.ID, StatusBlocked)
+	dependentWaiting, _ := manager.Get(dependent.ID)
+	if dependentWaiting.Waiting == nil || dependentWaiting.Waiting.Kind != "dependencies" {
+		t.Fatalf("dependent waiting = %+v, want dependency details", dependentWaiting.Waiting)
+	}
+	capacityWaitingRecord, _ := manager.Get(capacityWaiter.ID)
+	if capacityWaitingRecord.Waiting == nil || capacityWaitingRecord.Waiting.Kind != "capacity" || capacityWaitingRecord.Waiting.Capacity == nil || !capacityWaitingRecord.Waiting.Capacity.Waiting {
+		t.Fatalf("capacity waiter = %+v, want separate capacity wait", capacityWaitingRecord.Waiting)
+	}
 	got := manager.Capacity()
 	if got.WaitingDependencies != 1 || got.WaitingCapacity != 1 || got.Used != 1 {
 		t.Fatalf("capacity = %+v, want separate dependency and capacity waiters", got)
 	}
 	if err := manager.SetCapacity(0); err != nil {
 		t.Fatal(err)
+	}
+	capacityWaitingRecord, _ = manager.Get(capacityWaiter.ID)
+	if !capacityWaitingRecord.Waiting.Capacity.Waiting || capacityWaitingRecord.Waiting.Kind != "capacity" {
+		t.Fatalf("capacity wait after shrink = %+v", capacityWaitingRecord.Waiting)
 	}
 	if got := manager.Capacity(); got.Used != 1 || got.WaitingDependencies != 1 || got.WaitingCapacity != 1 {
 		t.Fatalf("shrunk capacity = %+v", got)
@@ -800,6 +835,10 @@ func TestDependencyAndCapacityWaitersSeparatedDuringCancelAndResize(t *testing.T
 		t.Fatal(err)
 	}
 	waitForStatus(t, manager, dependent.ID, StatusCanceled)
+	canceledDependent, _ := manager.Get(dependent.ID)
+	if canceledDependent.Waiting != nil {
+		t.Fatalf("canceled dependent retained waiting state: %+v", canceledDependent.Waiting)
+	}
 	if got := manager.Capacity(); got.WaitingDependencies != 0 || got.WaitingCapacity != 1 {
 		t.Fatalf("after dependency cancel = %+v", got)
 	}
@@ -855,9 +894,23 @@ func TestRestartRequiresManualConfirmationAndRevalidatesStaleDependencyBasis(t *
 	t.Cleanup(manager.Stop)
 
 	waitForStatus(t, manager, "uncertain-prereq", StatusUncertain)
-	waitForStatus(t, manager, "stale-dependent", StatusBlocked)
+	staleBlocked := waitForStatus(t, manager, "stale-dependent", StatusBlocked)
+	if staleBlocked.Waiting == nil || staleBlocked.Waiting.Kind != "dependencies" || len(staleBlocked.Waiting.Dependencies) != 1 {
+		t.Fatalf("restarted stale waiter = %+v, want refreshed dependency wait", staleBlocked.Waiting)
+	}
+	if staleBlocked.Waiting.Dependencies[0].Ready || staleBlocked.Waiting.Dependencies[0].PrerequisiteStatus != StatusUncertain {
+		t.Fatalf("restarted dependency detail = %+v, want uncertain prerequisite", staleBlocked.Waiting.Dependencies[0])
+	}
 	waitForStatus(t, manager, "independent", StatusSucceeded)
-	got := manager.Capacity()
+	deadline := time.Now().Add(3 * time.Second)
+	var got CapacityResponse
+	for time.Now().Before(deadline) {
+		got = manager.Capacity()
+		if got.Used == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	if got.WaitingDependencies != 1 || got.WaitingCapacity != 0 || got.Used != 0 {
 		t.Fatalf("capacity after restart = %+v", got)
 	}
@@ -865,6 +918,9 @@ func TestRestartRequiresManualConfirmationAndRevalidatesStaleDependencyBasis(t *
 		t.Fatalf("manual replacement failed: %v ok=%v", err, ok)
 	}
 	completed := waitForStatus(t, manager, "stale-dependent", StatusSucceeded)
+	if completed.Waiting != nil {
+		t.Fatalf("restarted task retained stale waiting state: %+v", completed.Waiting)
+	}
 	if completed.DependencyBasis["uncertain-prereq"] == "stale" {
 		t.Fatalf("stale basis was retained: %+v", completed.DependencyBasis)
 	}
