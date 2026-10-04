@@ -120,6 +120,18 @@ func (s *Store) QueuedRecords() []Invocation {
 	return records
 }
 
+func (s *Store) WaitingRecords() []Invocation {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var records []Invocation
+	for _, record := range s.records {
+		if record.Status == StatusQueued || record.Status == StatusBlocked {
+			records = append(records, record.Clone())
+		}
+	}
+	return records
+}
+
 func (s *Store) persistLocked() error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
 		return err

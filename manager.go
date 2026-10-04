@@ -17,9 +17,17 @@ var ErrQueueFull = errors.New("execution queue is full")
 const defaultGroup = "default"
 
 type queuedTask struct {
-	id    string
-	group string
-	cost  int
+	id       string
+	group    string
+	cost     int
+	resolved []ResolvedDependency
+}
+
+type blockedTask struct {
+	group    string
+	cost     int
+	ready    bool
+	resolved []ResolvedDependency
 }
 
 // Manager schedules invocations against a unit-based capacity. Each task
@@ -37,6 +45,7 @@ type Manager struct {
 	running   map[string]int
 	cancels   map[string]context.CancelFunc
 	queue     []queuedTask
+	blocked   map[string]blockedTask
 	lastGroup string
 	stopping  bool
 	wg        sync.WaitGroup
@@ -59,12 +68,13 @@ func NewManager(store *Store, registry Registry, capacity, queueSize int) (*Mana
 		queueSize: queueSize,
 		running:   make(map[string]int),
 		cancels:   make(map[string]context.CancelFunc),
+		blocked:   make(map[string]blockedTask),
 	}
 	return manager, nil
 }
 
 func (m *Manager) Start() {
-	queued := m.store.QueuedRecords()
+	queued := m.store.WaitingRecords()
 	sort.Slice(queued, func(i, j int) bool {
 		if queued[i].CreatedAt != queued[j].CreatedAt {
 			return queued[i].CreatedAt < queued[j].CreatedAt
@@ -73,9 +83,38 @@ func (m *Manager) Start() {
 	})
 	for _, record := range queued {
 		cost, group := normalizedCostGroup(record.Cost, record.Group)
+		if record.Status == StatusBlocked {
+			resolved, ready := m.checkDependencies(record)
+			m.mu.Lock()
+			m.blocked[record.ID] = blockedTask{group: group, cost: cost, ready: ready, resolved: resolved}
+			if ready {
+				m.promoteReadyBlockedLocked(record)
+				m.scheduleLocked()
+			}
+			m.mu.Unlock()
+			_ = m.noteBlockedReason(record.ID, ready)
+			continue
+		}
 		m.mu.Lock()
-		admitted := m.admitLocked(record.ID, group, cost)
+		resolved, _ := m.checkDependencies(record)
+		resolvedReady := len(record.DependsOn) == 0 || resolved != nil
+		admitted := false
+		if resolvedReady {
+			admitted = m.admitLocked(record.ID, group, cost, resolved)
+		} else {
+			m.blocked[record.ID] = blockedTask{group: group, cost: cost}
+		}
 		m.mu.Unlock()
+		if !resolvedReady {
+			if _, _, err := m.store.Transition(record.ID, StatusQueued, StatusBlocked, func(next *Invocation) {
+				next.ResolvedDependencies = nil
+				next.Error = "waiting for prerequisite results"
+				next.UpdatedAt = nowRFC3339()
+			}); err != nil {
+				return
+			}
+			continue
+		}
 		if !admitted {
 			m.finishRejected(record.ID, "execution queue is full after restart")
 		}
@@ -102,6 +141,9 @@ func (m *Manager) Submit(req InvokeRequest) (Invocation, error) {
 	if req.Cost < 0 {
 		return Invocation{}, errors.New("cost must be non-negative")
 	}
+	if err := validateDependencies(req.DependsOn); err != nil {
+		return Invocation{}, err
+	}
 	cost, group := normalizedCostGroup(req.Cost, req.Group)
 	timeoutMs := req.TimeoutMs
 	if timeoutMs <= 0 {
@@ -115,12 +157,17 @@ func (m *Manager) Submit(req InvokeRequest) (Invocation, error) {
 		argument = json.RawMessage(`{}`)
 	}
 	now := nowRFC3339()
+	id := newID()
+	if err := m.validateDependencyGraph(id, req.DependsOn); err != nil {
+		return Invocation{}, err
+	}
 	record := Invocation{
-		ID:        newID(),
+		ID:        id,
 		Function:  req.Function,
 		Argument:  argument,
 		Cost:      cost,
 		Group:     group,
+		DependsOn: append([]DependencyRequirement(nil), req.DependsOn...),
 		TimeoutMs: timeoutMs,
 		Status:    StatusQueued,
 		CreatedAt: now,
@@ -136,10 +183,25 @@ func (m *Manager) Submit(req InvokeRequest) (Invocation, error) {
 		return Invocation{}, err
 	}
 	m.mu.Lock()
-	admitted := m.admitLocked(record.ID, group, cost)
+	resolved, dependenciesReady := m.checkDependencies(record)
+	admitted := true
+	if dependenciesReady {
+		admitted = m.admitLocked(record.ID, group, cost, resolved)
+	} else {
+		m.blocked[record.ID] = blockedTask{group: group, cost: cost}
+	}
 	m.mu.Unlock()
 	if !admitted {
 		return m.finishRejected(record.ID, "execution queue is full")
+	}
+	if !dependenciesReady {
+		if _, _, err := m.store.Transition(record.ID, StatusQueued, StatusBlocked, func(next *Invocation) {
+			next.Error = "waiting for prerequisite results"
+			next.UpdatedAt = nowRFC3339()
+		}); err != nil {
+			return Invocation{}, err
+		}
+		record.Status = StatusBlocked
 	}
 	return record, nil
 }
@@ -147,26 +209,226 @@ func (m *Manager) Submit(req InvokeRequest) (Invocation, error) {
 // admitLocked either starts the task immediately or appends it to the
 // bounded waiting queue. With a zero-size queue only tasks that can be
 // scheduled right now are accepted.
-func (m *Manager) admitLocked(id, group string, cost int) bool {
+func (m *Manager) admitLocked(id, group string, cost int, resolved []ResolvedDependency) bool {
 	if m.stopping {
 		return false
 	}
 	if len(m.queue) == 0 && m.used+cost <= m.capacity {
-		m.startLocked(id, cost)
+		m.startLocked(id, cost, resolved)
 		return true
 	}
 	if len(m.queue) >= m.queueSize {
 		return false
 	}
-	m.queue = append(m.queue, queuedTask{id: id, group: group, cost: cost})
+	m.queue = append(m.queue, queuedTask{id: id, group: group, cost: cost, resolved: resolved})
 	return true
 }
 
-func (m *Manager) startLocked(id string, cost int) {
+func (m *Manager) startLocked(id string, cost int, resolved []ResolvedDependency) {
 	m.used += cost
 	m.running[id] = cost
 	m.wg.Add(1)
-	go m.execute(id, cost)
+	go m.execute(id, cost, resolved)
+}
+
+func (m *Manager) checkDependencies(record Invocation) ([]ResolvedDependency, bool) {
+	if len(record.DependsOn) == 0 {
+		return nil, true
+	}
+	resolved := make([]ResolvedDependency, 0, len(record.DependsOn))
+	for _, dep := range record.DependsOn {
+		prerequisite, ok := m.store.Get(dep.ID)
+		if !ok || prerequisite.Status != StatusSucceeded || !artifactPresent(prerequisite.Result, dep.Artifact) {
+			return nil, false
+		}
+		resolved = append(resolved, ResolvedDependency{
+			ID:              dep.ID,
+			Artifact:        dep.Artifact,
+			SourceUpdatedAt: prerequisite.UpdatedAt,
+		})
+	}
+	return resolved, true
+}
+
+func artifactPresent(result json.RawMessage, artifact string) bool {
+	if artifact == "" {
+		return len(result) > 0
+	}
+	var values map[string]json.RawMessage
+	if err := json.Unmarshal(result, &values); err != nil {
+		return false
+	}
+	value, ok := values[artifact]
+	return ok && !isNullJSON(value)
+}
+
+func isNullJSON(value json.RawMessage) bool {
+	return string(value) == "null"
+}
+
+func (m *Manager) canAdmitLocked(cost int) bool {
+	if m.stopping {
+		return false
+	}
+	return (len(m.queue) == 0 && m.used+cost <= m.capacity) || len(m.queue) < m.queueSize
+}
+
+func (m *Manager) promoteReadyBlockedLocked(records ...Invocation) {
+	var candidates []Invocation
+	if len(records) > 0 {
+		candidates = records
+	} else {
+		for _, record := range m.storeListReadyBlockedLocked() {
+			candidates = append(candidates, record)
+		}
+		sort.Slice(candidates, func(i, j int) bool {
+			if candidates[i].CreatedAt != candidates[j].CreatedAt {
+				return candidates[i].CreatedAt < candidates[j].CreatedAt
+			}
+			return candidates[i].ID < candidates[j].ID
+		})
+	}
+	for _, record := range candidates {
+		cost, group := normalizedCostGroup(record.Cost, record.Group)
+		entry, ok := m.blocked[record.ID]
+		if !ok || !entry.ready || !m.canAdmitLocked(cost) {
+			continue
+		}
+		_, transitioned, err := m.store.Transition(record.ID, StatusBlocked, StatusQueued, func(next *Invocation) {
+			next.ResolvedDependencies = append([]ResolvedDependency(nil), entry.resolved...)
+			next.Error = ""
+			next.UpdatedAt = nowRFC3339()
+		})
+		if err != nil || !transitioned {
+			continue
+		}
+		delete(m.blocked, record.ID)
+		m.admitLocked(record.ID, group, cost, entry.resolved)
+	}
+}
+
+func (m *Manager) storeListReadyBlockedLocked() map[string]Invocation {
+	candidates := make(map[string]Invocation)
+	for id, entry := range m.blocked {
+		if !entry.ready {
+			continue
+		}
+		if record, ok := m.store.Get(id); ok {
+			candidates[id] = record
+		}
+	}
+	return candidates
+}
+
+func (m *Manager) advanceDependents(prerequisiteID string) {
+	dependents := m.store.List()
+	sort.Slice(dependents, func(i, j int) bool {
+		if dependents[i].CreatedAt != dependents[j].CreatedAt {
+			return dependents[i].CreatedAt < dependents[j].CreatedAt
+		}
+		return dependents[i].ID < dependents[j].ID
+	})
+	for _, record := range dependents {
+		if record.Status != StatusBlocked || !hasDependency(record.DependsOn, prerequisiteID) {
+			continue
+		}
+		resolved, ready := m.checkDependencies(record)
+		m.mu.Lock()
+		entry, ok := m.blocked[record.ID]
+		if ok {
+			entry.ready = ready
+			entry.resolved = resolved
+			m.blocked[record.ID] = entry
+		}
+		if ready {
+			m.promoteReadyBlockedLocked(record)
+			m.scheduleLocked()
+		}
+		m.mu.Unlock()
+		_ = m.noteBlockedReason(record.ID, ready)
+	}
+}
+
+func (m *Manager) resolvedDependenciesStillValid(resolved []ResolvedDependency) bool {
+	for _, snapshot := range resolved {
+		prerequisite, ok := m.store.Get(snapshot.ID)
+		if !ok || prerequisite.Status != StatusSucceeded || prerequisite.UpdatedAt != snapshot.SourceUpdatedAt || !artifactPresent(prerequisite.Result, snapshot.Artifact) {
+			return false
+		}
+	}
+	return true
+}
+
+func hasDependency(deps []DependencyRequirement, id string) bool {
+	for _, dep := range deps {
+		if dep.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) noteBlockedReason(id string, ready bool) error {
+	if ready {
+		return nil
+	}
+	_, _, err := m.store.Transition(id, StatusBlocked, StatusBlocked, func(next *Invocation) {
+		next.Error = "waiting for prerequisite results"
+		next.UpdatedAt = nowRFC3339()
+	})
+	return err
+}
+
+func validateDependencies(deps []DependencyRequirement) error {
+	seen := make(map[string]bool)
+	for _, dep := range deps {
+		if dep.ID == "" {
+			return errors.New("dependency id is required")
+		}
+		if seen[dep.ID] {
+			return fmt.Errorf("duplicate dependency %q", dep.ID)
+		}
+		seen[dep.ID] = true
+	}
+	return nil
+}
+
+func (m *Manager) validateDependencyGraph(id string, deps []DependencyRequirement) error {
+	visiting := map[string]bool{id: true}
+	visited := make(map[string]bool)
+	var visit func(string) error
+	visit = func(current string) error {
+		if visiting[current] {
+			return errors.New("dependency cycle detected")
+		}
+		if visited[current] {
+			return nil
+		}
+		visiting[current] = true
+		record, ok := m.store.Get(current)
+		if ok {
+			for _, dep := range record.DependsOn {
+				if _, exists := m.store.Get(dep.ID); !exists {
+					return fmt.Errorf("dependency %q not found", dep.ID)
+				}
+				if err := visit(dep.ID); err != nil {
+					return err
+				}
+			}
+		}
+		delete(visiting, current)
+		visited[current] = true
+		return nil
+	}
+	for _, dep := range deps {
+		if _, ok := m.store.Get(dep.ID); !ok {
+			return fmt.Errorf("dependency %q not found", dep.ID)
+		}
+		if err := visit(dep.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // scheduleLocked dispatches queued tasks while capacity allows. The next
@@ -182,9 +444,23 @@ func (m *Manager) scheduleLocked() {
 			return
 		}
 		task := m.queue[index]
+		if !m.resolvedDependenciesStillValid(task.resolved) {
+			m.queue = append(m.queue[:index], m.queue[index+1:]...)
+			m.returnQueuedTaskToBlockedLocked(task)
+			continue
+		}
 		m.queue = append(m.queue[:index], m.queue[index+1:]...)
-		m.startLocked(task.id, task.cost)
+		m.startLocked(task.id, task.cost, task.resolved)
 	}
+}
+
+func (m *Manager) returnQueuedTaskToBlockedLocked(task queuedTask) {
+	_, _, _ = m.store.Transition(task.id, StatusQueued, StatusBlocked, func(next *Invocation) {
+		next.ResolvedDependencies = nil
+		next.Error = "waiting for prerequisite results"
+		next.UpdatedAt = nowRFC3339()
+	})
+	m.blocked[task.id] = blockedTask{group: task.group, cost: task.cost}
 }
 
 func (m *Manager) pickLocked() int {
@@ -244,6 +520,18 @@ func (m *Manager) Cancel(id string) (Invocation, bool, error) {
 			m.mu.Unlock()
 		}
 		return updated, transitioned, err
+	case StatusBlocked:
+		updated, transitioned, err := m.store.Transition(id, StatusBlocked, StatusCanceled, func(next *Invocation) {
+			next.Error = "canceled while waiting for prerequisites"
+			next.FinishedAt = nowRFC3339()
+			next.UpdatedAt = next.FinishedAt
+		})
+		if transitioned {
+			m.mu.Lock()
+			delete(m.blocked, id)
+			m.mu.Unlock()
+		}
+		return updated, transitioned, err
 	case StatusRunning:
 		m.mu.Lock()
 		cancel := m.cancels[id]
@@ -265,6 +553,8 @@ func (m *Manager) SetCapacity(capacity int) error {
 	m.mu.Lock()
 	m.capacity = capacity
 	m.scheduleLocked()
+	m.promoteReadyBlockedLocked()
+	m.scheduleLocked()
 	m.mu.Unlock()
 	return nil
 }
@@ -273,12 +563,23 @@ func (m *Manager) Capacity() CapacityResponse {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return CapacityResponse{
-		Capacity:  m.capacity,
-		Used:      m.used,
-		Running:   len(m.running),
-		Waiting:   len(m.queue),
-		QueueSize: m.queueSize,
+		Capacity:            m.capacity,
+		Used:                m.used,
+		Running:             len(m.running),
+		Waiting:             len(m.queue) + m.readyBlockedCountLocked(),
+		WaitingDependencies: len(m.blocked) - m.readyBlockedCountLocked(),
+		QueueSize:           m.queueSize,
 	}
+}
+
+func (m *Manager) readyBlockedCountLocked() int {
+	count := 0
+	for _, entry := range m.blocked {
+		if entry.ready {
+			count++
+		}
+	}
+	return count
 }
 
 func (m *Manager) removeQueuedLocked(id string) {
@@ -302,18 +603,22 @@ func (m *Manager) runningCount() int {
 	return len(m.running)
 }
 
-func (m *Manager) execute(id string, cost int) {
+func (m *Manager) execute(id string, cost int, resolved []ResolvedDependency) {
 	defer func() {
 		m.mu.Lock()
 		delete(m.running, id)
 		delete(m.cancels, id)
 		m.used -= cost
 		m.scheduleLocked()
+		m.promoteReadyBlockedLocked()
+		m.scheduleLocked()
 		m.mu.Unlock()
 		m.wg.Done()
+		m.advanceDependents(id)
 	}()
 	record, ok, err := m.store.Transition(id, StatusQueued, StatusRunning, func(next *Invocation) {
 		next.StartedAt = nowRFC3339()
+		next.ResolvedDependencies = append([]ResolvedDependency(nil), resolved...)
 		next.UpdatedAt = next.StartedAt
 	})
 	if err != nil || !ok {
@@ -394,6 +699,40 @@ func (m *Manager) markTerminal(id, status string, result json.RawMessage, messag
 		next.FinishedAt = nowRFC3339()
 		next.UpdatedAt = next.FinishedAt
 	})
+}
+
+func (m *Manager) ReplaceResult(id string, req ResultReplacementRequest) (Invocation, bool, error) {
+	if len(req.Result) == 0 || !json.Valid(req.Result) {
+		return Invocation{}, false, errors.New("valid result JSON is required")
+	}
+	record, ok := m.store.Get(id)
+	if !ok {
+		return Invocation{}, false, nil
+	}
+	switch record.Status {
+	case StatusFailed, StatusTimedOut, StatusCanceled, StatusUncertain:
+	default:
+		return record, false, errors.New("only failed, canceled, rejected, timed out, or uncertain results can be replaced")
+	}
+	updated, _, err := m.store.Transition(id, record.Status, StatusSucceeded, func(next *Invocation) {
+		next.Result = append(json.RawMessage(nil), req.Result...)
+		next.Error = ""
+		next.Resolution = req.Basis
+		next.UpdatedAt = nowRFC3339()
+		if next.FinishedAt == "" {
+			next.FinishedAt = next.UpdatedAt
+		}
+	})
+	if err != nil {
+		return Invocation{}, false, err
+	}
+	m.mu.Lock()
+	m.scheduleLocked()
+	m.promoteReadyBlockedLocked()
+	m.scheduleLocked()
+	m.mu.Unlock()
+	m.advanceDependents(id)
+	return updated, true, nil
 }
 
 func (m *Manager) Stop() {

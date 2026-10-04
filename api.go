@@ -72,6 +72,23 @@ func NewRouter(manager *Manager) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, record)
 	})
+	mux.HandleFunc("PUT /v1/invocations/{id}/result", func(w http.ResponseWriter, r *http.Request) {
+		var request ResultReplacementRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid JSON body"})
+			return
+		}
+		record, ok, err := manager.ReplaceResult(r.PathValue("id"), request)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+			return
+		}
+		if !ok {
+			writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "invocation not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, record)
+	})
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/") && r.URL.Path != "/" {
 			http.NotFound(w, r)

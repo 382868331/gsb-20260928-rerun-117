@@ -17,11 +17,12 @@ go run . -addr :8080 -slots 2 -queue 4 -data data/state.json
 ## API
 
 - `GET /v1/functions`：列出内置函数。
-- `POST /v1/invocations`：提交调用，请求形如 `{"function":"add","argument":{"a":1,"b":2},"timeout_ms":1000,"cost":1,"group":"default"}`。
+- `POST /v1/invocations`：提交调用，请求形如 `{"function":"add","argument":{"a":1,"b":2},"timeout_ms":1000,"cost":1,"group":"default","depends_on":[{"id":"...","artifact":"sum"}]}`。
 - `GET /v1/invocations/{id}`：读取持久化调用记录。
 - `POST /v1/invocations/{id}/cancel`：取消排队中的调用，或请求取消运行中的可中断函数。
 - `GET /v1/capacity`：查看当前容量、已占用单元、运行与等待数量。
 - `PUT /v1/capacity`：运行期间调整总容量，请求形如 `{"capacity":4}`。
+- `PUT /v1/invocations/{id}/result`：操作者为失败、取消、超时或结果未知的前置任务人工提供已确认结果，请求形如 `{"result":{"sum":3},"basis":"核对单号..."}`。
 
 容量以单元计：每个任务通过 `cost` 声明占用的单元数（默认 1），运行期间真实占用这些单元。另有有界等待队列。可用容量不足且队列占满时，接口返回 `503`，状态记录为 `rejected`，不会继续创建执行任务。等待队列长度为零时，只接纳能够立即调度的任务。
 
@@ -29,8 +30,12 @@ go run . -addr :8080 -slots 2 -queue 4 -data data/state.json
 
 等待任务按 `group` 分组公平调度：组间轮转、组内先进先出。当轮到某个任务但剩余容量不足以容纳其 `cost` 时，空闲单元会为它保留，持续到来的轻任务不能让一个合法重任务永久没有机会。`cost` 超过当前总容量的提交会被直接拒绝。
 
+任务可在 `depends_on` 中声明一个或多个前置任务及需要的产物名；省略产物名表示需要前置任务的任意非空结果。菱形依赖中两个分支彼此独立，可以分别继续执行；汇合任务只有在所有前置结果和产物都确认可用后，才从 `blocked`（等待依赖）转为 `queued`（等待容量）并进入有界队列参与资源竞争。容量响应分别报告 `waiting_dependencies` 与 `waiting_capacity`，阻塞任务不占用执行单元，也不会提前占住队列名额。
+
+前置任务失败、取消、超时、重启后结果未知，或缺少指定产物时，后续任务保持 `blocked`，系统不会自动重放或重做前置效果。操作者可通过结果替换接口提供人工核对后的结果；所有受影响的后续任务会按最新 `updated_at` 和产物重新核对依据，核对通过后仍必须重新经过成本、组公平等待和有界队列准入，不能因为一批依赖同时解锁而绕过容量限制。依赖未满足时取消后续任务会标记为 `canceled`；取消后即使前置被人工补结果，也不会自动复活。
+
 等待取消、执行超时与容量变化可能同时发生；容量占用只在执行真正结束时释放一次，排队条目只在状态成功转移时移除一次，不会重复释放或重复占用。
 
-状态使用原子替换的 JSON 文件持久化。终态包括 `succeeded`、`failed`、`timed_out`、`canceled`、`rejected`。重启时上次处于 `running` 的请求无法确认外部观察结果，会明确标记为 `uncertain`；已完成记录保持不变，仍排队的记录会重新进入有界队列。
+状态使用原子替换的 JSON 文件持久化。终态包括 `succeeded`、`failed`、`timed_out`、`canceled`、`rejected`。重启时上次处于 `running` 的请求无法确认外部观察结果，会明确标记为 `uncertain`；已完成记录保持不变，`blocked` 记录会重新核对依赖，`queued` 记录会重新进入有界队列。仍未知的前置结果需要人工确认；只有重新核对依据后的后续任务才能继续执行。
 
 超时或取消后，函数晚到的结果只会被忽略，不能把终态覆盖成成功。新增函数应接收 `context.Context` 并及时响应取消，沿用同一套提交、排队、执行、终态记录生命周期。

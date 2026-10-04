@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -467,7 +468,6 @@ func TestStopAndRestartReprocessesWaitingQueue(t *testing.T) {
 	}
 }
 
-
 func blockingRegistry(started chan string, release chan struct{}) Registry {
 	return Registry{
 		"block": func(ctx context.Context, argument json.RawMessage) (any, error) {
@@ -681,4 +681,239 @@ func itoa(value int) string {
 		value /= 10
 	}
 	return string(digits)
+}
+
+func TestDiamondDependenciesSeparateWaitAndAllowIndependentBranch(t *testing.T) {
+	store := newTestStore(t)
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	manager, err := NewManager(store, Registry{
+		"block": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			started <- struct{}{}
+			select {
+			case <-release:
+				return map[string]any{"ok": true}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+		"echo": echoFunction,
+	}, 3, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(manager.Stop)
+
+	root, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 30000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	left, err := manager.Submit(InvokeRequest{Function: "echo", DependsOn: []DependencyRequirement{{ID: root.ID, Artifact: "ok"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := manager.Submit(InvokeRequest{Function: "echo", DependsOn: []DependencyRequirement{{ID: root.ID, Artifact: "ok"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tip, err := manager.Submit(InvokeRequest{Function: "echo", DependsOn: []DependencyRequirement{{ID: left.ID}, {ID: right.ID}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	independent, err := manager.Submit(InvokeRequest{Function: "echo", Argument: json.RawMessage(`{"text":"independent"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitForStatus(t, manager, left.ID, StatusBlocked)
+	waitForStatus(t, manager, right.ID, StatusBlocked)
+	waitForStatus(t, manager, tip.ID, StatusBlocked)
+	waitForStatus(t, manager, independent.ID, StatusSucceeded)
+	if got := manager.Capacity(); got.Used != 1 || got.Waiting != 0 || got.WaitingDependencies != 3 {
+		t.Fatalf("capacity = %+v, want one used and three dependency waits", got)
+	}
+
+	close(release)
+	waitForStatus(t, manager, root.ID, StatusSucceeded)
+	waitForStatus(t, manager, left.ID, StatusSucceeded)
+	waitForStatus(t, manager, right.ID, StatusSucceeded)
+	waitForStatus(t, manager, tip.ID, StatusSucceeded)
+	record, _ := manager.Get(tip.ID)
+	if len(record.ResolvedDependencies) != 2 {
+		t.Fatalf("resolved dependencies = %d, want 2", len(record.ResolvedDependencies))
+	}
+}
+
+func TestCanceledPrerequisiteReplacementRechecksDependent(t *testing.T) {
+	store := newTestStore(t)
+	manager, err := NewManager(store, Registry{"fail": func(context.Context, json.RawMessage) (any, error) {
+		return nil, errors.New("boom")
+	}, "echo": echoFunction}, 2, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(manager.Stop)
+
+	prerequisite, err := manager.Submit(InvokeRequest{Function: "fail"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := manager.Submit(InvokeRequest{Function: "echo", DependsOn: []DependencyRequirement{{ID: prerequisite.ID, Artifact: "text"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, prerequisite.ID, StatusFailed)
+	waitForStatus(t, manager, child.ID, StatusBlocked)
+	if got := manager.Capacity(); got.Used != 0 || got.Waiting != 0 || got.WaitingDependencies != 1 {
+		t.Fatalf("blocked child capacity = %+v", got)
+	}
+	if _, _, err := manager.Cancel(child.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, child.ID, StatusCanceled)
+
+	updated, ok, err := manager.ReplaceResult(prerequisite.ID, ResultReplacementRequest{
+		Result: json.RawMessage(`{"text":"operator supplied"}`),
+		Basis:  "manual verification ticket",
+	})
+	if err != nil || !ok {
+		t.Fatalf("replace result = %+v %v, ok=%v", updated, err, ok)
+	}
+	childRecord, _ := manager.Get(child.ID)
+	if childRecord.Status != StatusCanceled {
+		t.Fatalf("canceled dependent was replayed: %s", childRecord.Status)
+	}
+
+	second, err := manager.Submit(InvokeRequest{Function: "echo", DependsOn: []DependencyRequirement{{ID: prerequisite.ID, Artifact: "text"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := waitForStatus(t, manager, second.ID, StatusSucceeded)
+	if string(record.Result) == "" || record.ResolvedDependencies[0].SourceUpdatedAt != updated.UpdatedAt {
+		t.Fatalf("second did not recheck replacement basis: %+v", record)
+	}
+}
+
+func TestBlockedDependentSurvivesCancelCapacityInterleaveAndRestart(t *testing.T) {
+	dataPath := filepath.Join(t.TempDir(), "state.json")
+	release := make(chan struct{})
+	registry := blockingRegistry(nil, release)
+	registry["echo"] = echoFunction
+	firstStore, err := OpenStore(dataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstManager, err := NewManager(firstStore, registry, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstManager.Start()
+	root, err := firstManager.Submit(InvokeRequest{Function: "block", TimeoutMs: 30000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, firstManager, root.ID, StatusRunning)
+	child, err := firstManager.Submit(InvokeRequest{Function: "echo", DependsOn: []DependencyRequirement{{ID: root.ID, Artifact: "ok"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, firstManager, child.ID, StatusBlocked)
+	if err := firstManager.SetCapacity(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := firstManager.SetCapacity(1); err != nil {
+		t.Fatal(err)
+	}
+	if got := firstManager.Capacity(); got.Used != 1 || got.Waiting != 0 || got.WaitingDependencies != 1 {
+		t.Fatalf("interleaved capacity = %+v", got)
+	}
+	firstManager.Stop()
+	waitForStatus(t, firstManager, root.ID, StatusCanceled)
+
+	secondStore, err := OpenStore(dataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondManager, err := NewManager(secondStore, Registry{"echo": echoFunction}, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondManager.Start()
+	t.Cleanup(secondManager.Stop)
+	waitForStatus(t, secondManager, root.ID, StatusCanceled)
+	childRecord := waitForStatus(t, secondManager, child.ID, StatusBlocked)
+	if childRecord.Error == "" {
+		t.Fatal("blocked child lacks prerequisite explanation")
+	}
+	updated, _, err := secondManager.ReplaceResult(root.ID, ResultReplacementRequest{Result: json.RawMessage(`{"ok":true}`), Basis: "restart review"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := waitForStatus(t, secondManager, child.ID, StatusSucceeded)
+	if got := len(record.ResolvedDependencies); got != 1 || record.ResolvedDependencies[0].SourceUpdatedAt != updated.UpdatedAt {
+		t.Fatalf("restart dependent basis = %+v", record.ResolvedDependencies)
+	}
+}
+
+func TestUncertainPrerequisiteRequiresManualConfirmationAfterRestart(t *testing.T) {
+	dataPath := filepath.Join(t.TempDir(), "state.json")
+	now := nowRFC3339()
+	root := Invocation{
+		ID:        "root",
+		Function:  "echo",
+		Status:    StatusRunning,
+		Cost:      1,
+		Group:     defaultGroup,
+		CreatedAt: now,
+		UpdatedAt: now,
+		StartedAt: now,
+	}
+	child := Invocation{
+		ID:        "child",
+		Function:  "echo",
+		Argument:  json.RawMessage(`{"text":"child"}`),
+		DependsOn: []DependencyRequirement{{ID: "root", Artifact: "text"}},
+		Status:    StatusBlocked,
+		Cost:      1,
+		Group:     defaultGroup,
+		TimeoutMs: 30000,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	firstStore, err := OpenStore(dataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := firstStore.Create(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := firstStore.Create(child); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenStore(dataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(store, Registry{"echo": echoFunction}, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(manager.Stop)
+	waitForStatus(t, manager, "root", StatusUncertain)
+	waitForStatus(t, manager, "child", StatusBlocked)
+	if got := manager.Capacity(); got.Used != 0 || got.Waiting != 0 || got.WaitingDependencies != 1 {
+		t.Fatalf("unknown prerequisite capacity = %+v", got)
+	}
+	if _, _, err := manager.ReplaceResult("root", ResultReplacementRequest{Result: json.RawMessage(`{"text":"confirmed"}`), Basis: "manual"}); err != nil {
+		t.Fatal(err)
+	}
+	record := waitForStatus(t, manager, "child", StatusSucceeded)
+	if record.Resolution != "" || record.ResolvedDependencies[0].ID != "root" {
+		t.Fatalf("child basis = %+v", record)
+	}
 }
