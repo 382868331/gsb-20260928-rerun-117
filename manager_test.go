@@ -39,6 +39,24 @@ func waitForStatus(t *testing.T, manager *Manager, id, want string) Invocation {
 	return Invocation{}
 }
 
+func waitForWaitingKind(t *testing.T, manager *Manager, id, want string) Invocation {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		record, ok := manager.Get(id)
+		if !ok {
+			t.Fatal("missing invocation")
+		}
+		if record.Status == StatusBlocked && record.Waiting != nil && record.Waiting.Kind == want {
+			return record
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	record, _ := manager.Get(id)
+	t.Fatalf("waiting = %+v, want kind %q", record.Waiting, want)
+	return Invocation{}
+}
+
 func TestQueueFullRejectsWithoutUnboundedTasks(t *testing.T) {
 	store := newTestStore(t)
 	registry := Registry{}
@@ -867,6 +885,166 @@ func TestRestartRequiresManualConfirmationAndRevalidatesStaleDependencyBasis(t *
 	completed := waitForStatus(t, manager, "stale-dependent", StatusSucceeded)
 	if completed.DependencyBasis["uncertain-prereq"] == "stale" {
 		t.Fatalf("stale basis was retained: %+v", completed.DependencyBasis)
+	}
+}
+
+func TestBlockedTaskReportsPerDependencyReasonsAndClearsThem(t *testing.T) {
+	store := newTestStore(t)
+	registry := Registry{
+		"echo": echoFunction,
+		"fail": func(context.Context, json.RawMessage) (any, error) { return nil, errors.New("boom") },
+	}
+	manager, err := NewManager(store, registry, 2, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(func() {
+		manager.Stop()
+	})
+
+	failed, err := manager.Submit(InvokeRequest{Function: "fail", TimeoutMs: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, failed.ID, StatusFailed)
+	partial, err := manager.Submit(InvokeRequest{Function: "echo", Argument: json.RawMessage(`{"text":"kept"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, partial.ID, StatusSucceeded)
+
+	dependent, err := manager.Submit(InvokeRequest{
+		Function:  "echo",
+		Argument:  json.RawMessage(`{"text":"join"}`),
+		TimeoutMs: 1000,
+		Dependencies: []Dependency{
+			{InvocationID: failed.ID},
+			{InvocationID: partial.ID, Artifacts: []string{"text", "missing"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := waitForStatus(t, manager, dependent.ID, StatusBlocked)
+	if blocked.Waiting == nil {
+		t.Fatalf("blocked record has no waiting info: %+v", blocked)
+	}
+	if blocked.Waiting.Kind != WaitingKindDependencies {
+		t.Fatalf("waiting kind = %q, want %q", blocked.Waiting.Kind, WaitingKindDependencies)
+	}
+	if blocked.Waiting.CheckedAt == "" {
+		t.Fatal("waiting info has no checked_at basis timestamp")
+	}
+	if len(blocked.Waiting.Reasons) != 2 {
+		t.Fatalf("waiting reasons = %+v, want one per unmet dependency", blocked.Waiting.Reasons)
+	}
+	var failedReason, artifactReason *DependencyWaitReason
+	for index := range blocked.Waiting.Reasons {
+		reason := &blocked.Waiting.Reasons[index]
+		switch reason.InvocationID {
+		case failed.ID:
+			failedReason = reason
+		case partial.ID:
+			artifactReason = reason
+		}
+	}
+	if failedReason == nil || failedReason.Status != StatusFailed {
+		t.Fatalf("failed dependency reason = %+v, want status %q", failedReason, StatusFailed)
+	}
+	if artifactReason == nil || len(artifactReason.MissingArtifacts) != 1 || artifactReason.MissingArtifacts[0] != "missing" {
+		t.Fatalf("artifact reason = %+v, want missing artifact \"missing\"", artifactReason)
+	}
+
+	if _, ok, err := manager.ReplaceResult(failed.ID, json.RawMessage(`{"text":"recovered"}`)); err != nil || !ok {
+		t.Fatalf("replace result ok=%v err=%v", ok, err)
+	}
+	refreshed := waitForStatus(t, manager, dependent.ID, StatusBlocked)
+	if refreshed.Waiting == nil || len(refreshed.Waiting.Reasons) != 1 || refreshed.Waiting.Reasons[0].InvocationID != partial.ID {
+		t.Fatalf("waiting reasons after replacement = %+v, want only the artifact reason", refreshed.Waiting)
+	}
+	if refreshed.Waiting.CheckedAt < blocked.Waiting.CheckedAt {
+		t.Fatalf("checked_at not refreshed: %q then %q", blocked.Waiting.CheckedAt, refreshed.Waiting.CheckedAt)
+	}
+
+	if _, ok, err := manager.ReplaceResult(partial.ID, json.RawMessage(`{"text":"kept","missing":"added"}`)); err == nil || ok {
+		t.Fatalf("replacement of succeeded prerequisite unexpectedly allowed: ok=%v err=%v", ok, err)
+	}
+	if _, _, err := manager.Cancel(dependent.ID); err != nil {
+		t.Fatal(err)
+	}
+	canceled := waitForStatus(t, manager, dependent.ID, StatusCanceled)
+	if canceled.Waiting != nil {
+		t.Fatalf("canceled record kept stale waiting info: %+v", canceled.Waiting)
+	}
+}
+
+func TestBlockedCapacityWaiterReportsCapacityKind(t *testing.T) {
+	store := newTestStore(t)
+	release := make(chan struct{})
+	registry := Registry{
+		"echo": echoFunction,
+		"fail": func(context.Context, json.RawMessage) (any, error) { return nil, errors.New("boom") },
+		"block": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			select {
+			case <-release:
+				return map[string]any{"ok": true}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	manager, err := NewManager(store, registry, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(func() {
+		manager.Stop()
+	})
+
+	prerequisite, err := manager.Submit(InvokeRequest{Function: "fail", TimeoutMs: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, prerequisite.ID, StatusFailed)
+	occupant, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, occupant.ID, StatusRunning)
+	queued, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, queued.ID, StatusQueued)
+	dependent, err := manager.Submit(InvokeRequest{
+		Function:     "echo",
+		Argument:     json.RawMessage(`{"text":"dep"}`),
+		TimeoutMs:    1000,
+		Dependencies: []Dependency{{InvocationID: prerequisite.ID}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := waitForStatus(t, manager, dependent.ID, StatusBlocked)
+	if blocked.Waiting == nil || blocked.Waiting.Kind != WaitingKindDependencies {
+		t.Fatalf("waiting = %+v, want kind %q while prerequisite failed", blocked.Waiting, WaitingKindDependencies)
+	}
+	if _, ok, err := manager.ReplaceResult(prerequisite.ID, json.RawMessage(`{"text":"base"}`)); err != nil || !ok {
+		t.Fatalf("replace result ok=%v err=%v", ok, err)
+	}
+	blocked = waitForWaitingKind(t, manager, dependent.ID, WaitingKindCapacity)
+	if len(blocked.Waiting.Reasons) != 0 {
+		t.Fatalf("capacity wait listed dependency reasons: %+v", blocked.Waiting.Reasons)
+	}
+	close(release)
+	finished := waitForStatus(t, manager, dependent.ID, StatusSucceeded)
+	if finished.Waiting != nil {
+		t.Fatalf("finished record kept stale waiting info: %+v", finished.Waiting)
+	}
+	if finished.DependencyBasis[prerequisite.ID] == "" {
+		t.Fatalf("dependency basis not recorded: %+v", finished.DependencyBasis)
 	}
 }
 

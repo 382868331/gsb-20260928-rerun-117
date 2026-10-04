@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -48,9 +49,18 @@ type Manager struct {
 }
 
 type dependencyCheck struct {
-	ready bool
-	basis map[string]string
-	error string
+	ready   bool
+	basis   map[string]string
+	reasons []DependencyWaitReason
+	error   string
+}
+
+func (c dependencyCheck) waitingInfo(kind string) *WaitingInfo {
+	return &WaitingInfo{
+		Kind:      kind,
+		Reasons:   append([]DependencyWaitReason(nil), c.reasons...),
+		CheckedAt: nowRFC3339(),
+	}
 }
 
 func NewManager(store *Store, registry Registry, capacity, queueSize int) (*Manager, error) {
@@ -113,7 +123,7 @@ func (m *Manager) Start() {
 		if check.ready {
 			admitted = m.admitLocked(record.ID, group, cost, record.CreatedAt)
 		} else {
-			m.markBlockedLocked(record.ID, check.error)
+			m.markBlockedLocked(record.ID, check)
 		}
 		m.mu.Unlock()
 		if !check.ready {
@@ -182,6 +192,9 @@ func (m *Manager) Submit(req InvokeRequest) (Invocation, error) {
 	if check.ready {
 		record.Status = StatusQueued
 		record.DependencyBasis = check.basis
+	} else {
+		record.Error = check.error
+		record.Waiting = check.waitingInfo(WaitingKindDependencies)
 	}
 	m.mu.Unlock()
 	if cost > capacity {
@@ -282,53 +295,85 @@ func createsCycle(graph map[string][]string, start string) bool {
 
 func (m *Manager) checkDependenciesLocked(record Invocation) dependencyCheck {
 	basis := make(map[string]string)
+	var reasons []DependencyWaitReason
 	for _, dependency := range record.Dependencies {
 		prerequisite, ok := m.store.Get(dependency.InvocationID)
 		if !ok {
-			return dependencyCheck{error: fmt.Sprintf("dependency %q does not exist", dependency.InvocationID)}
+			reasons = append(reasons, DependencyWaitReason{
+				InvocationID: dependency.InvocationID,
+				Reason:       "dependency does not exist",
+			})
+			continue
 		}
 		if prerequisite.Status != StatusSucceeded {
-			return dependencyCheck{error: fmt.Sprintf("dependency %q is %q and requires manual confirmation", prerequisite.ID, prerequisite.Status)}
+			reasons = append(reasons, DependencyWaitReason{
+				InvocationID: prerequisite.ID,
+				Status:       prerequisite.Status,
+				Reason:       fmt.Sprintf("dependency is %q and requires manual confirmation", prerequisite.Status),
+			})
+			continue
 		}
-		digest, err := artifactDigest(prerequisite.Result, dependency.Artifacts)
-		if err != nil {
-			return dependencyCheck{error: fmt.Sprintf("dependency %q artifacts are unavailable: %v", prerequisite.ID, err)}
+		digest, missing, err := artifactDigest(prerequisite.Result, dependency.Artifacts)
+		if err != nil || len(missing) > 0 {
+			reason := fmt.Sprintf("artifacts are unavailable: %v", err)
+			if err == nil {
+				reason = "requested artifacts are missing from the dependency result"
+			}
+			reasons = append(reasons, DependencyWaitReason{
+				InvocationID:     prerequisite.ID,
+				Status:           prerequisite.Status,
+				MissingArtifacts: missing,
+				Reason:           reason,
+			})
+			continue
 		}
 		basis[dependency.InvocationID] = digest
+	}
+	if len(reasons) > 0 {
+		summaries := make([]string, 0, len(reasons))
+		for _, reason := range reasons {
+			summaries = append(summaries, fmt.Sprintf("dependency %q: %s", reason.InvocationID, reason.Reason))
+		}
+		return dependencyCheck{reasons: reasons, error: strings.Join(summaries, "; ")}
 	}
 	return dependencyCheck{ready: true, basis: basis}
 }
 
-func artifactDigest(result json.RawMessage, artifacts []string) (string, error) {
+func artifactDigest(result json.RawMessage, artifacts []string) (string, []string, error) {
 	var value any
 	if len(result) == 0 {
-		return "", errors.New("missing result")
+		return "", nil, errors.New("missing result")
 	}
 	if err := json.Unmarshal(result, &value); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	selected := make(map[string]any)
+	var missing []string
 	if len(artifacts) == 0 {
 		selected["__result__"] = value
 	} else {
 		values, ok := value.(map[string]any)
 		if !ok {
-			return "", errors.New("result is not a JSON object")
+			return "", nil, errors.New("result is not a JSON object")
 		}
 		for _, artifact := range artifacts {
 			artifactValue, ok := values[artifact]
 			if !ok {
-				return "", fmt.Errorf("missing artifact %q", artifact)
+				missing = append(missing, artifact)
+				continue
 			}
 			selected[artifact] = artifactValue
 		}
 	}
+	if len(missing) > 0 {
+		return "", missing, nil
+	}
 	encoded, err := json.Marshal(selected)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	hash := sha256.Sum256(encoded)
-	return hex.EncodeToString(hash[:]), nil
+	return hex.EncodeToString(hash[:]), nil, nil
 }
 
 func (m *Manager) processBlockedLocked() {
@@ -343,18 +388,19 @@ func (m *Manager) processBlockedLocked() {
 		}
 		check := m.checkDependenciesLocked(record)
 		if !check.ready {
-			m.updateBlockedReasonLocked(id, check.error)
+			m.updateBlockedReasonLocked(id, check, WaitingKindDependencies)
 			remaining = append(remaining, id)
 			continue
 		}
 		if !m.canEnterCapacityLocked(record.Cost) {
-			m.updateBlockedReasonLocked(id, "dependencies available; waiting for execution capacity")
+			m.updateBlockedReasonLocked(id, dependencyCheck{ready: true, error: "dependencies available; waiting for execution capacity"}, WaitingKindCapacity)
 			remaining = append(remaining, id)
 			continue
 		}
 		updated, transitioned, err := m.store.Transition(id, StatusBlocked, StatusQueued, func(next *Invocation) {
 			next.DependencyBasis = check.basis
 			next.Error = ""
+			next.Waiting = nil
 			next.UpdatedAt = nowRFC3339()
 		})
 		if err != nil || !transitioned {
@@ -368,24 +414,56 @@ func (m *Manager) processBlockedLocked() {
 	m.blocked = remaining
 }
 
-func (m *Manager) updateBlockedReasonLocked(id, reason string) {
+func (m *Manager) updateBlockedReasonLocked(id string, check dependencyCheck, kind string) {
 	record, ok := m.store.Get(id)
-	if !ok || record.Status != StatusBlocked || record.Error == reason {
+	if !ok || record.Status != StatusBlocked {
+		return
+	}
+	if record.Error == check.error && record.Waiting != nil && record.Waiting.Kind == kind && waitingReasonsEqual(record.Waiting.Reasons, check.reasons) {
 		return
 	}
 	_, _, _ = m.store.Transition(id, StatusBlocked, StatusBlocked, func(next *Invocation) {
-		next.Error = reason
+		next.Error = check.error
+		next.Waiting = check.waitingInfo(kind)
 		next.UpdatedAt = nowRFC3339()
 	})
 }
 
-func (m *Manager) markBlockedLocked(id, reason string) {
+func waitingReasonsEqual(previous, current []DependencyWaitReason) bool {
+	if len(previous) != len(current) {
+		return false
+	}
+	for index := range previous {
+		if previous[index].InvocationID != current[index].InvocationID ||
+			previous[index].Status != current[index].Status ||
+			previous[index].Reason != current[index].Reason ||
+			!stringSlicesEqual(previous[index].MissingArtifacts, current[index].MissingArtifacts) {
+			return false
+		}
+	}
+	return true
+}
+
+func stringSlicesEqual(previous, current []string) bool {
+	if len(previous) != len(current) {
+		return false
+	}
+	for index := range previous {
+		if previous[index] != current[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *Manager) markBlockedLocked(id string, check dependencyCheck) {
 	record, ok := m.store.Get(id)
 	if !ok {
 		return
 	}
 	_, _, _ = m.store.Transition(id, record.Status, StatusBlocked, func(next *Invocation) {
-		next.Error = reason
+		next.Error = check.error
+		next.Waiting = check.waitingInfo(WaitingKindDependencies)
 		next.DependencyBasis = nil
 		next.UpdatedAt = nowRFC3339()
 	})
@@ -435,7 +513,7 @@ func (m *Manager) startLocked(id string, cost int) {
 	}
 	check := m.checkDependenciesLocked(record)
 	if !check.ready {
-		m.markBlockedLocked(id, check.error)
+		m.markBlockedLocked(id, check)
 		return
 	}
 	ctx, cancel := context.WithTimeout(m.stopCtx, time.Duration(record.TimeoutMs)*time.Millisecond)
@@ -524,6 +602,7 @@ func (m *Manager) Cancel(id string) (Invocation, bool, error) {
 	case StatusBlocked:
 		updated, transitioned, err := m.store.Transition(id, StatusBlocked, StatusCanceled, func(next *Invocation) {
 			next.Error = "canceled while waiting for dependencies"
+			next.Waiting = nil
 			next.FinishedAt = nowRFC3339()
 			next.UpdatedAt = next.FinishedAt
 		})
@@ -537,6 +616,7 @@ func (m *Manager) Cancel(id string) (Invocation, bool, error) {
 	case StatusQueued:
 		updated, transitioned, err := m.store.Transition(id, StatusQueued, StatusCanceled, func(next *Invocation) {
 			next.Error = "canceled before execution started"
+			next.Waiting = nil
 			next.FinishedAt = nowRFC3339()
 			next.UpdatedAt = next.FinishedAt
 		})
@@ -669,7 +749,10 @@ func (m *Manager) invalidateDependentsLocked(changedID string) {
 			continue
 		}
 		m.removeQueuedLocked(task.id)
-		m.markBlockedLocked(task.id, "dependency result replaced; dependency basis must be rechecked")
+		if check.ready {
+			check = dependencyCheck{error: "dependency result replaced; dependency basis must be rechecked"}
+		}
+		m.markBlockedLocked(task.id, check)
 	}
 }
 

@@ -19,6 +19,30 @@ type Dependency struct {
 	Artifacts    []string `json:"artifacts,omitempty"`
 }
 
+const (
+	WaitingKindDependencies = "dependencies"
+	WaitingKindCapacity     = "capacity"
+)
+
+// DependencyWaitReason explains why one prerequisite still blocks the task:
+// it is missing, not yet succeeded, needs manual confirmation, or requested
+// artifacts are absent from its result.
+type DependencyWaitReason struct {
+	InvocationID     string   `json:"invocation_id"`
+	Status           string   `json:"status,omitempty"`
+	MissingArtifacts []string `json:"missing_artifacts,omitempty"`
+	Reason           string   `json:"reason"`
+}
+
+// WaitingInfo describes the current wait of a blocked task. Kind separates
+// waiting on dependencies from waiting on execution capacity; CheckedAt is
+// the time of the most recent dependency re-check behind the reasons.
+type WaitingInfo struct {
+	Kind      string                 `json:"kind"`
+	Reasons   []DependencyWaitReason `json:"reasons,omitempty"`
+	CheckedAt string                 `json:"checked_at"`
+}
+
 type Invocation struct {
 	ID              string            `json:"id"`
 	Function        string            `json:"function"`
@@ -28,6 +52,7 @@ type Invocation struct {
 	TimeoutMs       int               `json:"timeout_ms"`
 	Dependencies    []Dependency      `json:"dependencies,omitempty"`
 	DependencyBasis map[string]string `json:"dependency_basis,omitempty"`
+	Waiting         *WaitingInfo      `json:"waiting,omitempty"`
 	Status          string            `json:"status"`
 	Result          json.RawMessage   `json:"result,omitempty"`
 	Error           string            `json:"error,omitempty"`
@@ -81,6 +106,14 @@ func (r *Invocation) Clone() Invocation {
 	}
 	if r.Result != nil {
 		copyValue.Result = append(json.RawMessage(nil), r.Result...)
+	}
+	if r.Waiting != nil {
+		waiting := *r.Waiting
+		waiting.Reasons = append([]DependencyWaitReason(nil), r.Waiting.Reasons...)
+		for index := range waiting.Reasons {
+			waiting.Reasons[index].MissingArtifacts = append([]string(nil), r.Waiting.Reasons[index].MissingArtifacts...)
+		}
+		copyValue.Waiting = &waiting
 	}
 	return copyValue
 }
