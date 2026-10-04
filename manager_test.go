@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -310,7 +311,6 @@ func TestConcurrentSubmissionsRespectZeroQueue(t *testing.T) {
 	}
 	manager.Start()
 	t.Cleanup(func() {
-		close(release)
 		manager.Stop()
 	})
 
@@ -374,7 +374,6 @@ func TestImmediateCancelReleasesWaitingCapacity(t *testing.T) {
 	}
 	manager.Start()
 	t.Cleanup(func() {
-		close(release)
 		manager.Stop()
 	})
 
@@ -466,7 +465,6 @@ func TestStopAndRestartReprocessesWaitingQueue(t *testing.T) {
 		t.Fatalf("running after restart drained = %d, want 0", got)
 	}
 }
-
 
 func blockingRegistry(started chan string, release chan struct{}) Registry {
 	return Registry{
@@ -669,6 +667,207 @@ func TestConcurrentCancelTimeoutAndCapacityChange(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("capacity leaked: %+v", manager.Capacity())
+}
+
+func TestDiamondDependenciesKeepIndependentBranchRunning(t *testing.T) {
+	store := newTestStore(t)
+	release := make(chan struct{})
+	registry := Registry{
+		"echo": echoFunction,
+		"fail": func(context.Context, json.RawMessage) (any, error) { return nil, errors.New("boom") },
+		"block": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			select {
+			case <-release:
+				return map[string]any{"ok": true}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	manager, err := NewManager(store, registry, 2, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(func() {
+		manager.Stop()
+	})
+
+	left, err := manager.Submit(InvokeRequest{Function: "echo", Argument: json.RawMessage(`{"text":"left"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := manager.Submit(InvokeRequest{Function: "fail", TimeoutMs: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, left.ID, StatusSucceeded)
+	waitForStatus(t, manager, right.ID, StatusFailed)
+
+	join, err := manager.Submit(InvokeRequest{
+		Function:  "echo",
+		Argument:  json.RawMessage(`{"text":"join"}`),
+		TimeoutMs: 1000,
+		Dependencies: []Dependency{
+			{InvocationID: left.ID, Artifacts: []string{"text"}},
+			{InvocationID: right.ID},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	independent, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, join.ID, StatusBlocked)
+	waitForStatus(t, manager, independent.ID, StatusRunning)
+	secondIndependent, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, secondIndependent.ID, StatusRunning)
+	got := manager.Capacity()
+	if got.WaitingDependencies != 1 || got.WaitingCapacity != 0 || got.Used != 2 {
+		t.Fatalf("capacity = %+v, want one dependency waiter and two running independent tasks", got)
+	}
+
+	replaced, ok, err := manager.ReplaceResult(right.ID, json.RawMessage(`{"text":"right"}`))
+	if err != nil || !ok {
+		t.Fatalf("replace result = %+v %v, ok=%v", replaced, err, ok)
+	}
+	close(release)
+	waitForStatus(t, manager, join.ID, StatusSucceeded)
+	waitForStatus(t, manager, secondIndependent.ID, StatusSucceeded)
+	joinRecord, _ := manager.Get(join.ID)
+	if len(joinRecord.DependencyBasis) != 2 {
+		t.Fatalf("dependency basis = %+v, want both prerequisites", joinRecord.DependencyBasis)
+	}
+}
+
+func TestDependencyAndCapacityWaitersSeparatedDuringCancelAndResize(t *testing.T) {
+	store := newTestStore(t)
+	release := make(chan struct{})
+	registry := Registry{
+		"echo": waitFunction,
+		"block": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			select {
+			case <-release:
+				return map[string]any{"ok": true}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	manager, err := NewManager(store, registry, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(func() {
+		manager.Stop()
+	})
+
+	prerequisite, err := manager.Submit(InvokeRequest{Function: "echo", Argument: json.RawMessage(`{"ms":10000}`), TimeoutMs: 20000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, prerequisite.ID, StatusRunning)
+	dependent, err := manager.Submit(InvokeRequest{
+		Function:     "block",
+		TimeoutMs:    5000,
+		Dependencies: []Dependency{{InvocationID: prerequisite.ID, Artifacts: []string{"waited_ms"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capacityWaiter, err := manager.Submit(InvokeRequest{Function: "block", TimeoutMs: 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, dependent.ID, StatusBlocked)
+	got := manager.Capacity()
+	if got.WaitingDependencies != 1 || got.WaitingCapacity != 1 || got.Used != 1 {
+		t.Fatalf("capacity = %+v, want separate dependency and capacity waiters", got)
+	}
+	if err := manager.SetCapacity(0); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.Capacity(); got.Used != 1 || got.WaitingDependencies != 1 || got.WaitingCapacity != 1 {
+		t.Fatalf("shrunk capacity = %+v", got)
+	}
+	if _, _, err := manager.Cancel(dependent.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, dependent.ID, StatusCanceled)
+	if got := manager.Capacity(); got.WaitingDependencies != 0 || got.WaitingCapacity != 1 {
+		t.Fatalf("after dependency cancel = %+v", got)
+	}
+	if err := manager.SetCapacity(2); err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, capacityWaiter.ID, StatusRunning)
+	manager.Cancel(prerequisite.ID)
+	waitForStatus(t, manager, prerequisite.ID, StatusCanceled)
+	close(release)
+	waitForStatus(t, manager, capacityWaiter.ID, StatusSucceeded)
+}
+
+func TestRestartRequiresManualConfirmationAndRevalidatesStaleDependencyBasis(t *testing.T) {
+	dataPath := filepath.Join(t.TempDir(), "state.json")
+	registry := Registry{"echo": echoFunction}
+	firstStore, err := OpenStore(dataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := nowRFC3339()
+	uncertainPrerequisite := Invocation{ID: "uncertain-prereq", Function: "echo", Status: StatusRunning, Cost: 1, Group: defaultGroup, TimeoutMs: 5000, CreatedAt: now, UpdatedAt: now, StartedAt: now}
+	knownPrerequisite := Invocation{ID: "known-prereq", Function: "echo", Status: StatusSucceeded, Cost: 1, Group: defaultGroup, TimeoutMs: 5000, Result: json.RawMessage(`{"text":"known"}`), CreatedAt: now, UpdatedAt: now, FinishedAt: now}
+	staleDependent := Invocation{
+		ID:              "stale-dependent",
+		Function:        "echo",
+		Status:          StatusQueued,
+		Cost:            1,
+		Group:           defaultGroup,
+		TimeoutMs:       5000,
+		Argument:        json.RawMessage(`{"text":"stale"}`),
+		Dependencies:    []Dependency{{InvocationID: "uncertain-prereq", Artifacts: []string{"text"}}},
+		DependencyBasis: map[string]string{"uncertain-prereq": "stale"},
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	independent := Invocation{ID: "independent", Function: "echo", Status: StatusQueued, Cost: 1, Group: defaultGroup, TimeoutMs: 5000, Argument: json.RawMessage(`{"text":"independent"}`), CreatedAt: now, UpdatedAt: now}
+	for _, record := range []Invocation{uncertainPrerequisite, knownPrerequisite, staleDependent, independent} {
+		if err := firstStore.Create(record); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	secondStore, err := OpenStore(dataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(secondStore, registry, 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Start()
+	t.Cleanup(manager.Stop)
+
+	waitForStatus(t, manager, "uncertain-prereq", StatusUncertain)
+	waitForStatus(t, manager, "stale-dependent", StatusBlocked)
+	waitForStatus(t, manager, "independent", StatusSucceeded)
+	got := manager.Capacity()
+	if got.WaitingDependencies != 1 || got.WaitingCapacity != 0 || got.Used != 0 {
+		t.Fatalf("capacity after restart = %+v", got)
+	}
+	if _, ok, err := manager.ReplaceResult("uncertain-prereq", json.RawMessage(`{"text":"confirmed"}`)); err != nil || !ok {
+		t.Fatalf("manual replacement failed: %v ok=%v", err, ok)
+	}
+	completed := waitForStatus(t, manager, "stale-dependent", StatusSucceeded)
+	if completed.DependencyBasis["uncertain-prereq"] == "stale" {
+		t.Fatalf("stale basis was retained: %+v", completed.DependencyBasis)
+	}
 }
 
 func itoa(value int) string {

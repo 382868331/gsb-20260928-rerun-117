@@ -18,12 +18,20 @@ go run . -addr :8080 -slots 2 -queue 4 -data data/state.json
 
 - `GET /v1/functions`：列出内置函数。
 - `POST /v1/invocations`：提交调用，请求形如 `{"function":"add","argument":{"a":1,"b":2},"timeout_ms":1000,"cost":1,"group":"default"}`。
+- 可通过 `dependencies` 声明前置调用及所需产物，例如 `"dependencies":[{"invocation_id":"...","artifacts":["sum"]}]`；`artifacts` 为空表示需要整个结果。
 - `GET /v1/invocations/{id}`：读取持久化调用记录。
 - `POST /v1/invocations/{id}/cancel`：取消排队中的调用，或请求取消运行中的可中断函数。
+- `PUT /v1/invocations/{id}/result`：操作者把 `failed`、`timed_out`、`canceled` 或 `uncertain` 的前置结果人工替换为可用 JSON。
 - `GET /v1/capacity`：查看当前容量、已占用单元、运行与等待数量。
 - `PUT /v1/capacity`：运行期间调整总容量，请求形如 `{"capacity":4}`。
 
 容量以单元计：每个任务通过 `cost` 声明占用的单元数（默认 1），运行期间真实占用这些单元。另有有界等待队列。可用容量不足且队列占满时，接口返回 `503`，状态记录为 `rejected`，不会继续创建执行任务。等待队列长度为零时，只接纳能够立即调度的任务。
+
+未满足前置条件的任务记录为 `blocked`，只进入无成本的依赖等待集合，不预占执行单元，也不会进入有界容量队列。`GET /v1/capacity` 分别返回 `waiting_dependencies` 和 `waiting_capacity`：前者仍在等待前置成功及所需产物，后者已经通过前置核对、正在等待执行容量。依赖恰好解锁但容量队列暂满时，任务仍保留在依赖等待集合中，直到有准入空位。
+
+只有前置状态为 `succeeded` 且请求的每个产物都存在时，后续任务才会把前置结果的 SHA-256 依据快照写入 `dependency_basis` 并进入容量准入。前置为 `failed`、`canceled`、`timed_out` 或重启后的 `uncertain` 时，系统不会自动重放前置效果；后续任务保持 `blocked` 并说明需要人工确认。操作者替换失败或未知前置的结果后，等待它的任务会重新核对产物和依据；已经在容量队列中但依据已变化的后续任务会退回 `blocked`，不能带着旧依据启动。
+
+同一批任务中彼此独立的分支不受失败前置影响，可继续占用容量并完成。菱形依赖中两个前置都成功且产物可用后，汇合任务才进入容量队列；成本、组间轮转和重任务空闲单元保留规则仍然作用于准入之后，不会因为一批依赖同时解锁而绕过。
 
 容量可在运行期间通过 `PUT /v1/capacity` 调整。缩容不会让正在执行的任务被凭空算作未占用：已占用单元只在任务真正结束时释放一次，后续接收与排队始终按真实剩余能力判断。
 
@@ -31,6 +39,6 @@ go run . -addr :8080 -slots 2 -queue 4 -data data/state.json
 
 等待取消、执行超时与容量变化可能同时发生；容量占用只在执行真正结束时释放一次，排队条目只在状态成功转移时移除一次，不会重复释放或重复占用。
 
-状态使用原子替换的 JSON 文件持久化。终态包括 `succeeded`、`failed`、`timed_out`、`canceled`、`rejected`。重启时上次处于 `running` 的请求无法确认外部观察结果，会明确标记为 `uncertain`；已完成记录保持不变，仍排队的记录会重新进入有界队列。
+状态使用原子替换的 JSON 文件持久化。终态包括 `succeeded`、`failed`、`timed_out`、`canceled`、`rejected`。重启时上次处于 `running` 的请求无法确认外部观察结果，会明确标记为 `uncertain`；已完成记录保持不变，`blocked` 记录继续等待前置，已通过前置核对的排队记录会重新经过有界队列准入并重新校验依据。
 
 超时或取消后，函数晚到的结果只会被忽略，不能把终态覆盖成成功。新增函数应接收 `context.Context` 并及时响应取消，沿用同一套提交、排队、执行、终态记录生命周期。
