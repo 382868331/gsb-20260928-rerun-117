@@ -60,6 +60,14 @@ func NewRouter(manager *Manager) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, record)
 	})
+	mux.HandleFunc("GET /v1/invocations/{id}/explanation", func(w http.ResponseWriter, r *http.Request) {
+		explanation, ok := manager.Explain(r.PathValue("id"))
+		if !ok {
+			writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "invocation not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, explanation)
+	})
 	mux.HandleFunc("POST /v1/invocations/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
 		record, ok, err := manager.Cancel(r.PathValue("id"))
 		if err != nil {

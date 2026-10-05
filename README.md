@@ -1,4 +1,6 @@
 # Local Function Execution Platform
+依赖解释图从被阻塞的调用出发逐层展开：`nodes` 中每个可达调用只出现一次（共享前置不重复），`edges` 指向其直接前置并标注是否满足、缺失产物与依据摘要（SHA-256）。节点的 `kind` 区分三种等待：`external_confirmation`（前置为 `failed`、`timed_out`、`canceled` 或 `uncertain`，等待人工确认）、`dependencies`（等待前置完成）与 `capacity`（前置已满足、等待执行容量）；已满足的前置不带 `kind`。`checked_at` 是最近一次核对依据的时间。若声明构成环，对应边会给出可读的循环路径（如 `[a,b,a]`）且不再递归。解释图绑定查询时的任务版本（`task_version` 即该任务的 `updated_at`）：替换前置结果后再次查询会反映最新原因，此前返回的图保持原样。查询本身完全只读，不会触发执行、准入或替用户确认外部结果。
+
 
 Go 标准库实现的本地函数执行平台。它只运行进程内注册表中的有限内置函数，不加载脚本、插件或任何外部提交的可执行代码。
 
@@ -20,6 +22,7 @@ go run . -addr :8080 -slots 2 -queue 4 -data data/state.json
 - `POST /v1/invocations`：提交调用，请求形如 `{"function":"add","argument":{"a":1,"b":2},"timeout_ms":1000,"cost":1,"group":"default"}`。
 - 可通过 `dependencies` 声明前置调用及所需产物，例如 `"dependencies":[{"invocation_id":"...","artifacts":["sum"]}]`；`artifacts` 为空表示需要整个结果。
 - `GET /v1/invocations/{id}`：读取持久化调用记录。
+- `GET /v1/invocations/{id}/explanation`：只读依赖解释图，逐层展示直接与间接前置、缺失产物和最近核对依据。
 - `POST /v1/invocations/{id}/cancel`：取消排队中的调用，或请求取消运行中的可中断函数。
 - `PUT /v1/invocations/{id}/result`：操作者把 `failed`、`timed_out`、`canceled` 或 `uncertain` 的前置结果人工替换为可用 JSON。
 - `GET /v1/capacity`：查看当前容量、已占用单元、运行与等待数量。

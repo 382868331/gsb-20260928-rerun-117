@@ -24,6 +24,11 @@ const (
 	WaitingKindCapacity     = "capacity"
 )
 
+// ExplanationKindExternalConfirmation marks explanation nodes whose
+// prerequisite outcome (failed, timed_out, canceled, uncertain) needs an
+// operator to confirm or replace the external result before dependents move.
+const ExplanationKindExternalConfirmation = "external_confirmation"
+
 // DependencyWaitReason explains why one prerequisite still blocks the task:
 // it is missing, not yet succeeded, needs manual confirmation, or requested
 // artifacts are absent from its result.
@@ -88,6 +93,46 @@ type CapacityResponse struct {
 	WaitingDependencies int `json:"waiting_dependencies"`
 	Blocked             int `json:"blocked"`
 	QueueSize           int `json:"queue_size"`
+}
+
+// DependencyExplanation is a read-only snapshot explaining why a task is
+// waiting. It is bound to the task version observed at query time
+// (TaskVersion is the task's updated_at); later result replacements produce
+// new explanations while previously returned ones stay unchanged. Shared
+// prerequisites appear exactly once in Nodes; edges reference node IDs.
+type DependencyExplanation struct {
+	InvocationID string            `json:"invocation_id"`
+	TaskVersion  string            `json:"task_version"`
+	GeneratedAt  string            `json:"generated_at"`
+	Root         string            `json:"root"`
+	Nodes        []ExplanationNode `json:"nodes"`
+}
+
+// ExplanationNode describes one invocation reachable from the queried task.
+// Kind distinguishes waiting on external confirmation, waiting on
+// dependencies, and waiting for capacity; it is empty for satisfied nodes.
+type ExplanationNode struct {
+	InvocationID string            `json:"invocation_id"`
+	Function     string            `json:"function"`
+	Status       string            `json:"status"`
+	Kind         string            `json:"kind,omitempty"`
+	Reason       string            `json:"reason,omitempty"`
+	CheckedAt    string            `json:"checked_at,omitempty"`
+	UpdatedAt    string            `json:"updated_at"`
+	Edges        []ExplanationEdge `json:"edges,omitempty"`
+}
+
+// ExplanationEdge links a node to one declared prerequisite. Cycle holds a
+// readable cycle path (e.g. [a,b,a]) when following the edge would revisit
+// a node already on the current path.
+type ExplanationEdge struct {
+	InvocationID     string   `json:"invocation_id"`
+	Status           string   `json:"status,omitempty"`
+	Satisfied        bool     `json:"satisfied"`
+	MissingArtifacts []string `json:"missing_artifacts,omitempty"`
+	Reason           string   `json:"reason,omitempty"`
+	Basis            string   `json:"basis,omitempty"`
+	Cycle            []string `json:"cycle,omitempty"`
 }
 
 type InvokeResponse struct {
