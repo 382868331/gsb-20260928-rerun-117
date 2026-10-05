@@ -20,6 +20,7 @@ go run . -addr :8080 -slots 2 -queue 4 -data data/state.json
 - `POST /v1/invocations`：提交调用，请求形如 `{"function":"add","argument":{"a":1,"b":2},"timeout_ms":1000,"cost":1,"group":"default"}`。
 - 可通过 `dependencies` 声明前置调用及所需产物，例如 `"dependencies":[{"invocation_id":"...","artifacts":["sum"]}]`；`artifacts` 为空表示需要整个结果。
 - `GET /v1/invocations/{id}`：读取持久化调用记录。
+- `GET /v1/invocations/{id}/explanation`：只读的依赖解释图。从被阻塞的调用出发逐层展开直接与间接前置，节点标注等待类型（`dependencies` 等待前置、`capacity` 等待执行容量、`external_confirmation` 等待人工确认外部结果），边标注每个前置的状态与缺失产物。共享前置只出现一次；环形声明在 `cycles` 中给出完整循环路径（提交时也会以同样路径被拒绝）。图的 `version` 绑定查询时任务记录的版本：替换前置结果后重新查询会得到反映最新原因的新图，已返回的旧图保持不变。查询本身不触发执行、不替操作者确认外部结果。
 - `POST /v1/invocations/{id}/cancel`：取消排队中的调用，或请求取消运行中的可中断函数。
 - `PUT /v1/invocations/{id}/result`：操作者把 `failed`、`timed_out`、`canceled` 或 `uncertain` 的前置结果人工替换为可用 JSON。
 - `GET /v1/capacity`：查看当前容量、已占用单元、运行与等待数量。

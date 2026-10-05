@@ -246,8 +246,8 @@ func (m *Manager) validateDependencies(req InvokeRequest) error {
 		seen[dependency.InvocationID] = true
 	}
 	graph[candidateID] = dependencyIDs(req.Dependencies)
-	if createsCycle(graph, candidateID) {
-		return errors.New("dependency cycle detected")
+	if cycle := findCyclePath(graph, candidateID); len(cycle) > 0 {
+		return fmt.Errorf("dependency cycle detected: %s", strings.Join(cycle, " -> "))
 	}
 	return nil
 }
@@ -260,24 +260,35 @@ func dependencyIDs(dependencies []Dependency) []string {
 	return ids
 }
 
-func createsCycle(graph map[string][]string, start string) bool {
+// findCyclePath returns one concrete cycle path (e.g. a -> b -> a) when the
+// dependency graph contains a cycle, or nil otherwise. Returning the path
+// makes the rejection understandable to the caller.
+func findCyclePath(graph map[string][]string, start string) []string {
 	state := make(map[string]int)
-	var visit func(string) bool
-	visit = func(id string) bool {
+	var stack []string
+	var visit func(string) []string
+	visit = func(id string) []string {
 		if state[id] == 2 {
-			return false
+			return nil
 		}
 		if state[id] == 1 {
-			return true
+			for index, stacked := range stack {
+				if stacked == id {
+					return append(append([]string(nil), stack[index:]...), id)
+				}
+			}
+			return []string{id, id}
 		}
 		state[id] = 1
+		stack = append(stack, id)
 		for _, next := range graph[id] {
-			if visit(next) {
-				return true
+			if cycle := visit(next); cycle != nil {
+				return cycle
 			}
 		}
+		stack = stack[:len(stack)-1]
 		state[id] = 2
-		return false
+		return nil
 	}
 	ids := []string{start}
 	for id := range graph {
@@ -286,11 +297,11 @@ func createsCycle(graph map[string][]string, start string) bool {
 		}
 	}
 	for _, id := range ids {
-		if visit(id) {
-			return true
+		if cycle := visit(id); cycle != nil {
+			return cycle
 		}
 	}
-	return false
+	return nil
 }
 
 func (m *Manager) checkDependenciesLocked(record Invocation) dependencyCheck {
@@ -591,6 +602,129 @@ func (m *Manager) pickLocked() int {
 
 func (m *Manager) Get(id string) (Invocation, bool) {
 	return m.store.Get(id)
+}
+
+// Explain builds a read-only dependency explanation graph for the given
+// task, bound to the task record version observed at query time. It never
+// mutates records, admits tasks, or confirms external results: it only
+// classifies what each direct and indirect prerequisite is still missing.
+// Shared prerequisites appear once; cyclic declarations are reported as
+// understandable cycle paths instead of being followed forever.
+func (m *Manager) Explain(id string) (ExplanationGraph, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	root, ok := m.store.Get(id)
+	if !ok {
+		return ExplanationGraph{}, false
+	}
+	checkedAt := nowRFC3339()
+	graph := ExplanationGraph{
+		Root:        root.ID,
+		Version:     root.UpdatedAt,
+		GeneratedAt: checkedAt,
+	}
+	visited := make(map[string]bool)
+	edgeSeen := make(map[string]bool)
+	onPath := make(map[string]int)
+	var path []string
+	var walk func(record Invocation)
+	walk = func(record Invocation) {
+		visited[record.ID] = true
+		graph.Nodes = append(graph.Nodes, m.explainNodeLocked(record, checkedAt))
+		onPath[record.ID] = len(path)
+		path = append(path, record.ID)
+		defer func() {
+			delete(onPath, record.ID)
+			path = path[:len(path)-1]
+		}()
+		for _, dependency := range record.Dependencies {
+			dependencyID := dependency.InvocationID
+			edgeKey := record.ID + "\x00" + dependencyID
+			if !edgeSeen[edgeKey] {
+				edgeSeen[edgeKey] = true
+				graph.Edges = append(graph.Edges, m.explainEdgeLocked(record.ID, dependency))
+			}
+			if cycleStart, isCycle := onPath[dependencyID]; isCycle {
+				cycle := append(append([]string(nil), path[cycleStart:]...), dependencyID)
+				graph.Cycles = append(graph.Cycles, cycle)
+				continue
+			}
+			if visited[dependencyID] {
+				continue
+			}
+			prerequisite, found := m.store.Get(dependencyID)
+			if !found {
+				continue
+			}
+			walk(prerequisite)
+		}
+	}
+	walk(root)
+	return graph, true
+}
+
+// explainNodeLocked classifies what one task is currently waiting on
+// without changing any state.
+func (m *Manager) explainNodeLocked(record Invocation, checkedAt string) ExplanationNode {
+	node := ExplanationNode{
+		InvocationID: record.ID,
+		Function:     record.Function,
+		Status:       record.Status,
+		Wait:         ExplainWaitNone,
+	}
+	switch record.Status {
+	case StatusBlocked:
+		check := m.checkDependenciesLocked(record)
+		node.CheckedAt = checkedAt
+		if check.ready && !m.canEnterCapacityLocked(record.Cost) {
+			node.Wait = ExplainWaitCapacity
+		} else {
+			node.Wait = ExplainWaitDependencies
+		}
+	case StatusFailed, StatusTimedOut, StatusCanceled, StatusUncertain:
+		node.Wait = ExplainWaitExternalConfirmation
+	case StatusQueued:
+		node.Wait = ExplainWaitCapacity
+	}
+	return node
+}
+
+// explainEdgeLocked classifies one declared dependency edge against the
+// current prerequisite record, read-only.
+func (m *Manager) explainEdgeLocked(from string, dependency Dependency) ExplanationEdge {
+	edge := ExplanationEdge{
+		From:      from,
+		To:        dependency.InvocationID,
+		Artifacts: append([]string(nil), dependency.Artifacts...),
+	}
+	prerequisite, ok := m.store.Get(dependency.InvocationID)
+	if !ok {
+		edge.Status = EdgeMissingDependency
+		edge.Reason = "dependency does not exist"
+		return edge
+	}
+	switch prerequisite.Status {
+	case StatusSucceeded:
+		_, missing, err := artifactDigest(prerequisite.Result, dependency.Artifacts)
+		switch {
+		case err != nil:
+			edge.Status = EdgeMissingArtifacts
+			edge.Reason = fmt.Sprintf("artifacts are unavailable: %v", err)
+		case len(missing) > 0:
+			edge.Status = EdgeMissingArtifacts
+			edge.MissingArtifacts = missing
+			edge.Reason = "requested artifacts are missing from the dependency result"
+		default:
+			edge.Status = EdgeSatisfied
+		}
+	case StatusFailed, StatusTimedOut, StatusCanceled, StatusUncertain:
+		edge.Status = EdgeNeedsConfirmation
+		edge.Reason = fmt.Sprintf("dependency is %q and requires manual confirmation", prerequisite.Status)
+	default:
+		edge.Status = EdgeWaiting
+		edge.Reason = fmt.Sprintf("dependency is %q and has not finished", prerequisite.Status)
+	}
+	return edge
 }
 
 func (m *Manager) Cancel(id string) (Invocation, bool, error) {

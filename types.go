@@ -24,6 +24,16 @@ const (
 	WaitingKindCapacity     = "capacity"
 )
 
+// Wait kinds used by the explanation graph. WaitExternalConfirmation means
+// the task or prerequisite ended in a state (failed, timed_out, canceled,
+// uncertain) that only an operator can resolve by replacing the result.
+const (
+	ExplainWaitNone                 = "none"
+	ExplainWaitDependencies         = "dependencies"
+	ExplainWaitCapacity             = "capacity"
+	ExplainWaitExternalConfirmation = "external_confirmation"
+)
+
 // DependencyWaitReason explains why one prerequisite still blocks the task:
 // it is missing, not yet succeeded, needs manual confirmation, or requested
 // artifacts are absent from its result.
@@ -77,6 +87,50 @@ type ReplaceResultRequest struct {
 
 type CapacityRequest struct {
 	Capacity int `json:"capacity"`
+}
+
+// ExplanationNode is one task in the read-only dependency explanation
+// graph. Wait classifies what the task is currently waiting on.
+type ExplanationNode struct {
+	InvocationID string `json:"invocation_id"`
+	Function     string `json:"function"`
+	Status       string `json:"status"`
+	Wait         string `json:"wait"`
+	CheckedAt    string `json:"checked_at,omitempty"`
+}
+
+// ExplanationEdge is one declared dependency from a task (From) to its
+// prerequisite (To), with the artifacts required and the ones still missing.
+const (
+	EdgeSatisfied         = "satisfied"
+	EdgeWaiting           = "waiting"
+	EdgeNeedsConfirmation = "needs_confirmation"
+	EdgeMissingArtifacts  = "missing_artifacts"
+	EdgeMissingDependency = "missing_dependency"
+)
+
+type ExplanationEdge struct {
+	From             string   `json:"from"`
+	To               string   `json:"to"`
+	Artifacts        []string `json:"artifacts,omitempty"`
+	MissingArtifacts []string `json:"missing_artifacts,omitempty"`
+	Status           string   `json:"status"`
+	Reason           string   `json:"reason,omitempty"`
+}
+
+// ExplanationGraph is a read-only snapshot of everything a waiting task is
+// blocked on, direct and indirect. Shared prerequisites appear once in
+// Nodes; Cycles lists any cyclic declaration paths found while walking.
+// Version binds the graph to the root task record version (its UpdatedAt)
+// observed at query time: later result replacements produce a new graph
+// while previously returned graphs stay unchanged.
+type ExplanationGraph struct {
+	Root        string            `json:"root"`
+	Version     string            `json:"version"`
+	GeneratedAt string            `json:"generated_at"`
+	Nodes       []ExplanationNode `json:"nodes"`
+	Edges       []ExplanationEdge `json:"edges"`
+	Cycles      [][]string        `json:"cycles,omitempty"`
 }
 
 type CapacityResponse struct {
